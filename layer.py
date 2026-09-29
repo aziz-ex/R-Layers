@@ -1,7 +1,12 @@
 import json
 import os
+import subprocess
+import shutil
 from pathlib import Path
 from datetime import datetime
+from urllib.parse import urlparse
+
+ALLOWED_HOSTS = {"github.com"}
 
 
 class PackageAbstractionLayer:
@@ -77,6 +82,59 @@ class PackageAbstractionLayer:
             if info.get("type") == "bundled_app":
                 print(f"  {name} — by {info['credit_to']} ({info['license']})")
                 print(f"    Source: {info['source_url']}")
+
+    def download_app(self, name, apps_dir="pkg_cache/apps"):
+        """Clone a bundled app's repo and update its record."""
+        if name not in self.packages:
+            print(f"'{name}' not registered")
+            return False
+
+        info = self.packages[name]
+        if info.get("type") != "bundled_app":
+            print(f"'{name}' is not a bundled app")
+            return False
+
+        url = info.get("source_url", "")
+        host = urlparse(url).hostname or ""
+        if urlparse(url).scheme != "https" or host not in ALLOWED_HOSTS:
+            print(f"Refusing to clone from untrusted URL: {url}")
+            return False
+
+        dest = Path(apps_dir) / name
+        if dest.exists():
+            print(f"'{name}' already downloaded at {dest}")
+            return True
+
+        Path(apps_dir).mkdir(parents=True, exist_ok=True)
+
+        try:
+            subprocess.run(
+                ["git", "clone", "--depth", "1", "--", url, str(dest)],
+                check=True,
+                timeout=120,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.CalledProcessError as e:
+            print(f"Clone failed for '{name}': {e.stderr.strip()}")
+            shutil.rmtree(dest, ignore_errors=True)
+            return False
+        except subprocess.TimeoutExpired:
+            print(f"Clone timed out for '{name}'")
+            shutil.rmtree(dest, ignore_errors=True)
+            return False
+
+        commit_hash = subprocess.run(
+            ["git", "-C", str(dest), "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=True
+        ).stdout.strip()
+
+        info["local_path"] = str(dest)
+        info["commit"] = commit_hash
+        info["installed"] = True
+        self._save_cache()
+        print(f"'{name}' downloaded to {dest} (commit {commit_hash[:7]})")
+        return True
 
     def resolve_dependencies(self, package_name):
         """Resolve dependencies automatically."""
@@ -154,3 +212,6 @@ if __name__ == "__main__":
         "Ladybird Browser Initiative"
     )
     layer.print_credits()
+
+    print("\n" + "="*50)
+    layer.download_app("Flameshot")
