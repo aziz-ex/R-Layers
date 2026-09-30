@@ -187,6 +187,64 @@ class PackageAbstractionLayer:
         """Resolve dependencies automatically."""
         if package_name not in self.packages:
             return None
+            
+    def verify_app(self, name):
+        """Verify a downloaded app is intact.
+
+        Checks:
+          - Local files exist
+          - .git history is present
+          - Current commit hash matches the recorded one
+          - Marks app as verified in JSON
+        """
+        if name not in self.packages:
+            print(f"'{name}' not registered")
+            return False
+
+        info = self.packages[name]
+        local_path = info.get("local_path")
+        recorded_commit = info.get("commit")
+
+        if not local_path or not Path(local_path).exists():
+            print(f"'{name}' local files not found at {local_path}")
+            return False
+
+        # Check if .git folder exists
+        git_path = Path(local_path) / ".git"
+        if not git_path.exists():
+            print(f"'{name}' does not have .git history (not a cloned repo)")
+            return False
+
+        # Check file count (must be > 0)
+        try:
+            file_count = sum(1 for _ in Path(local_path).rglob("*"))
+            if file_count == 0:
+                print(f"'{name}' folder is empty")
+                return False
+        except Exception as e:
+            print(f"Error scanning '{name}': {e}")
+            return False
+
+        # Verify commit hash
+        try:
+            current_commit = subprocess.run(
+                ["git", "-C", str(local_path), "rev-parse", "HEAD"],
+                capture_output=True, text=True, check=True
+            ).stdout.strip()
+
+            if current_commit != recorded_commit:
+                print(f"'{name}' commit mismatch: recorded {recorded_commit[:7]}, "
+                      f"current {current_commit[:7]}")
+                return False
+        except subprocess.CalledProcessError as e:
+            print(f"Failed to verify commit for '{name}': {e.stderr.strip()}")
+            return False
+
+        # All checks passed
+        info["verified"] = True
+        self._save_cache()
+        print(f"✓ '{name}' verified successfully ({current_commit[:7]})")
+        return True
 
         resolved = {package_name}
         to_process = [package_name]
@@ -240,43 +298,56 @@ if __name__ == "__main__":
     print(f"Does 'python' exist? {layer.package_exists('python')}")
 
     print("\n" + "="*50)
+    print("Registering essential apps...")
+
+    # System-protected apps (hard to delete, require force=True)
+    layer.add_bundled_app(
+        "Nautilus",
+        "https://github.com/GNOME/nautilus",
+        "GPL-3.0",
+        "GNOME Project",
+        protection="system"
+    )
+
+    layer.add_bundled_app(
+        "Joplin",
+        "https://github.com/laurent22/joplin",
+        "AGPL-3.0",
+        "Laurent Cozic and Joplin Contributors",
+        protection="system"
+    )
+
     layer.add_bundled_app(
         "Flameshot",
         "https://github.com/flameshot-org/flameshot",
         "MIT",
         "Flameshot Contributors",
-        protection="removable"
-    )
-    layer.add_bundled_app(
-        "Joplin",
-        "https://github.com/laurent22/joplin",
-        "MIT",
-        "Laurent Cozic and Joplin Contributors",
-        protection="removable"
-    )
-    layer.add_bundled_app(
-        "Ladybird",
-        "https://github.com/LadybirdBrowser/ladybird",
-        "BSD 2-Clause",
-        "Ladybird Browser Initiative",
-        protection="removable"
-    )
-    layer.print_credits()
-
-    print("\n" + "="*50)
-    layer.download_app("Flameshot")
-
-
-    print("\n" + "="*50)
-
-    layer.add_bundled_app(
-        "FileManager",
-        "https://github.com/example/filemanager",
-        "MIT",
-        "Example Dev",
         protection="system"
     )
 
+    # Removable apps (easy to delete)
+    layer.add_bundled_app(
+        "Firefox",
+        "https://github.com/mozilla/mozilla-central",
+        "MPL-2.0",
+        "Mozilla Foundation",
+        protection="removable"
+    )
+
+    layer.add_bundled_app(
+        "World Clock",
+        "https://github.com/mmalecki/world-clock",
+        "MIT",
+        "Michał Małecki",
+        protection="removable"
+    )
+
+    print("\n" + "="*50)
+    print("Verifying downloaded apps...")
+    layer.verify_app("Flameshot")
+
+    print("\n" + "="*50)
+    print("All apps registered successfully!")
 
     layer.remove_app("FileManager")
 
