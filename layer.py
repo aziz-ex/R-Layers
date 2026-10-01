@@ -327,20 +327,41 @@ if __name__ == "__main__":
 
     # Removable apps (easy to delete)
     layer.add_bundled_app(
-        "Firefox",
-        "https://github.com/mozilla/mozilla-central",
-        "MPL-2.0",
-        "Mozilla Foundation",
+        "VLC",
+        "https://github.com/videolan/vlc",
+        "GPL-2.0",
+        "VideoLAN Organization",
         protection="removable"
     )
 
     layer.add_bundled_app(
-        "World Clock",
-        "https://github.com/mmalecki/world-clock",
-        "MIT",
-        "Michał Małecki",
+        "Blender",
+        "https://github.com/blender/blender",
+        "GPL-2.0",
+        "Blender Foundation",
         protection="removable"
     )
+
+        # Web browsers (removable)
+    layer.add_bundled_app(
+        "Ladybird",
+        "https://github.com/LadybirdBrowser/ladybird",
+        "BSD 2-Clause",
+        "Ladybird Browser Initiative",
+        protection="removable"
+    )
+
+    layer.add_bundled_app(
+        "qutebrowser",
+        "https://github.com/qutebrowser/qutebrowser",
+        "GPL-3.0",
+        "qutebrowser contributors",
+        protection="removable"
+    )
+
+    print("\n" + "="*50)
+    print("Downloading critical app...")
+    layer.download_app("Flameshot")
 
     print("\n" + "="*50)
     print("Verifying downloaded apps...")
