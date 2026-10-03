@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """R-Layers entry point: picks the right interface for the current session.
  
@@ -5,7 +6,9 @@
   python3 rlayers.py --web | --cli     force one of them
   python3 rlayers.py list
   python3 rlayers.py download|verify|remove NAME [--force]
+  python3 rlayers.py download-all
  
+Terminal menus use numbers only, so they work with any keyboard layout.
 Needs rlayers_web.py and layer.py in the same folder.
 """
 import argparse
@@ -13,6 +16,7 @@ import os
 import platform
 import sys
 import threading
+import unicodedata
 import webbrowser
 from http.server import ThreadingHTTPServer
  
@@ -21,22 +25,55 @@ from rlayers_web import RTL, detect_system, layer, load_strings
  
 CLI = {
     "en": {
-        "cli_pick": "Number = open app, l = language, q = quit",
-        "cli_actions": "d = download, v = verify, r = remove, b = back",
-        "cli_bad": "Invalid choice.", "cli_bye": "Goodbye.", "cli_cancelled": "Cancelled.",
+        "cli_prompt": "> ", "cli_sep": ", ",
+        "cli_all": "Download all apps", "cli_lang": "Change language",
+        "cli_quit": "Quit", "cli_back": "Back",
+        "cli_bad": "Invalid number, choose one of the numbers shown.",
+        "cli_bye": "Goodbye.", "cli_cancelled": "Cancelled.", "cli_yes_no": "1 = yes, 0 = no",
+        "cli_all_warn": "This downloads the source code of {n} apps. It can be several GB "
+                        "(Firefox and Blender are the largest) and take a long time.",
         "cli_type_name": "Protected app. Type its name to confirm removal: ",
-        "cli_lang_ask": "Language code (en, ar), empty for system default: ",
         "cli_fallback": "This console cannot display '{lang}', showing English.",
-        "cli_prompt": "> ",
     },
     "ar": {
-        "cli_pick": "رقم = فتح تطبيق، l = اللغة، q = خروج",
-        "cli_actions": "d = تنزيل، v = تحقق، r = حذف، b = رجوع",
-        "cli_bad": "اختيار غير صحيح.", "cli_bye": "إلى اللقاء.", "cli_cancelled": "تم الإلغاء.",
+        "cli_sep": "، ",
+        "cli_all": "تنزيل كل التطبيقات", "cli_lang": "تغيير اللغة",
+        "cli_quit": "خروج", "cli_back": "رجوع",
+        "cli_bad": "رقم غير صحيح، اختر رقماً من الأرقام الظاهرة.",
+        "cli_bye": "إلى اللقاء.", "cli_cancelled": "تم الإلغاء.", "cli_yes_no": "1 = نعم، 0 = لا",
+        "cli_all_warn": "سيتم تنزيل كود المصدر لـ {n} تطبيقات. قد يصل الحجم إلى عدة غيغابايت "
+                        "(Firefox وBlender الأكبر) وقد يستغرق وقتاً طويلاً.",
         "cli_type_name": "تطبيق محمي. اكتب اسمه لتأكيد الحذف: ",
-        "cli_lang_ask": "رمز اللغة (en, ar)، أو اتركه فارغاً لحسب النظام: ",
     },
 }
+ 
+# invisible direction marks that a terminal may paste in front of what you type
+STRIP = dict.fromkeys(map(ord, "\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069\ufeff"))
+ 
+ 
+def clean(text):
+    return text.translate(STRIP).strip()
+ 
+ 
+def pick(prompt):
+    """Read a menu number. Accepts Western and Arabic-Indic digits.
+ 
+    Returns the number, None for an empty line, or -1 for anything that is not a number.
+    """
+    raw = clean(input(prompt))
+    if raw.lower() in ("q", "quit", "exit"):
+        return 0
+    if not raw:
+        return None
+    if len(raw) > 6:
+        return -1
+    digits = ""
+    for ch in raw:
+        d = unicodedata.decimal(ch, None)
+        if d is None:
+            return -1
+        digits += str(d)
+    return int(digits)
  
  
 def can_show(code):
@@ -70,7 +107,7 @@ def label(t, info):
     if info.get("verified"):
         parts.append(t["verified"])
     parts.append(t["system_p"] if info.get("protection") == "system" else t["removable_p"])
-    return ", ".join(parts)
+    return t["cli_sep"].join(parts)
  
  
 def show_list(t):
@@ -78,7 +115,7 @@ def show_list(t):
     if not items:
         print(t["no_apps"])
     for n, (name, info) in enumerate(items, 1):
-        print(f" {n}) {name}  [{info.get('license', '')}]  {label(t, info)}")
+        print(f" {n}. {name}  {info.get('license', '')}  -  {label(t, info)}")
     return items
  
  
@@ -94,27 +131,45 @@ def run(action, name, force=False):
     return layer.remove_app(name, force=force)
  
  
+def download_all():
+    layer.packages = layer._load_cache()
+    return layer.download_all()
+ 
+ 
 def app_menu(t, name, info):
-    protected = info.get("protection") == "system"
     print(f"\n{name}: {label(t, info)}")
-    print(t["cli_actions"])
-    choice = input(t["cli_prompt"]).strip().lower()
-    if choice == "d":
+    print(f" 1. {t['download']}\n 2. {t['verify']}\n 3. {t['remove']}\n 0. {t['cli_back']}")
+    choice = pick(t["cli_prompt"])
+    if choice in (0, None):
+        return
+    if choice == 1:
         run("download", name)
-    elif choice == "v":
+    elif choice == 2:
         run("verify", name)
-    elif choice == "r":
-        if protected:  # a conscious decision: the exact name must be typed
-            if input(t["cli_type_name"]).strip() != name:
-                print(t["cli_cancelled"])
-                return
+    elif choice == 3 and info.get("protection") == "system":
+        # a conscious decision: the exact name must be typed
+        if clean(input(t["cli_type_name"])) == name:
             run("remove", name, force=True)
-        elif input(t["confirm_remove"].format(n=name) + " [y/N] ").strip().lower() == "y":
+        else:
+            print(t["cli_cancelled"])
+    elif choice == 3:
+        print(t["confirm_remove"].format(n=name))
+        print(t["cli_yes_no"])
+        if pick(t["cli_prompt"]) == 1:
             run("remove", name)
         else:
             print(t["cli_cancelled"])
-    elif choice not in ("b", ""):
+    else:
         print(t["cli_bad"])
+ 
+ 
+def language_menu(t, current):
+    options = [("", t["auto"]), ("en", "English"), ("ar", "العربية")]
+    for n, (_, name) in enumerate(options, 1):
+        print(f" {n}. {name}")
+    print(f" 0. {t['cli_back']}")
+    choice = pick(t["cli_prompt"])
+    return options[choice - 1][0] if choice and 1 <= choice <= len(options) else current
  
  
 def menu(lang=""):
@@ -128,15 +183,24 @@ def menu(lang=""):
             if fallback:
                 print(t["cli_fallback"].format(lang=fallback))
             items = show_list(t)
-            print(t["cli_pick"])
-            choice = input(t["cli_prompt"]).strip().lower()
-            if choice == "q":
+            all_no, lang_no = len(items) + 1, len(items) + 2
+            print(f" {all_no}. {t['cli_all']}\n {lang_no}. {t['cli_lang']}\n 0. {t['cli_quit']}")
+            choice = pick(t["cli_prompt"])
+            if choice is None:
+                continue
+            if choice == 0:
                 break
-            if choice == "l":
-                lang = input(t["cli_lang_ask"]).strip().lower()
-            elif choice.isdigit() and 1 <= int(choice) <= len(items):
-                name, info = items[int(choice) - 1]
-                app_menu(t, name, info)
+            if 1 <= choice <= len(items):
+                app_menu(t, *items[choice - 1])
+            elif choice == all_no and items:
+                print(t["cli_all_warn"].format(n=len(items)))
+                print(t["cli_yes_no"])
+                if pick(t["cli_prompt"]) == 1:
+                    download_all()
+                else:
+                    print(t["cli_cancelled"])
+            elif choice == lang_no:
+                lang = language_menu(t, lang)
             else:
                 print(t["cli_bad"])
     except (EOFError, KeyboardInterrupt):
@@ -173,7 +237,8 @@ def serve_web():
  
 def main():
     p = argparse.ArgumentParser(prog="rlayers.py", description="R-Layers package and app manager")
-    p.add_argument("command", nargs="?", choices=["list", "download", "verify", "remove"])
+    p.add_argument("command", nargs="?",
+                   choices=["list", "download", "download-all", "verify", "remove"])
     p.add_argument("name", nargs="?")
     p.add_argument("--force", action="store_true", help="allow removing a protected app")
     p.add_argument("--web", action="store_true", help="force the web UI")
@@ -183,6 +248,8 @@ def main():
  
     if a.command == "list":
         show_list(strings_for(a.lang or detect_system()["lang"])[0])
+    elif a.command == "download-all":
+        sys.exit(0 if download_all() else 1)
     elif a.command:
         if not a.name:
             p.error(f"'{a.command}' needs an app name")
