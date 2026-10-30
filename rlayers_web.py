@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """R-Layers local web UI.
- 
+
 Run from the project folder:  python3 rlayers_web.py
 It opens http://127.0.0.1:8765 in the default browser.
- 
+
 On start-up it reads the system kernel and language, then decides whether the
 interface needs translating. English is the source language, so no translation
 is needed there. To add a language, drop locales/<code>.json next to this
@@ -14,22 +14,35 @@ import io
 import json
 import os
 import platform
+import locale
+import re
 import secrets
 import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
- 
-os.chdir(Path(__file__).resolve().parent)
-from layer import PackageAbstractionLayer  # noqa: E402
- 
+
+from layer import PackageAbstractionLayer
+from storage import RegistryError
+import app_runtime
+from version import __version__
+
 HOST, PORT = "127.0.0.1", 8765
 TOKEN = secrets.token_urlsafe(16)
 LOCK = threading.Lock()
 RTL = {"ar", "he", "fa", "ur"}
-layer = PackageAbstractionLayer()
- 
+layer = None
+INIT_LOCK = threading.Lock()
+
+
+def get_layer():
+    global layer
+    with INIT_LOCK:
+        if layer is None:
+            layer = PackageAbstractionLayer()
+    return layer
+
 STRINGS = {
     "en": {
         "title": "R-Layers", "subtitle": "Package and app manager",
@@ -37,77 +50,103 @@ STRINGS = {
         "kernel": "Kernel", "arch": "Architecture", "syslang": "System language",
         "translation": "Translation",
         "mode_none": "Source language (English), no translation needed",
-        "mode_translated": "Translated automatically",
+        "mode_translated": "Available translation",
         "mode_fallback": "No translation for this language yet, showing English",
-        "apps": "Bundled apps", "no_apps": "No apps registered. Run python3 layer.py first.",
-        "download": "Download", "verify": "Verify", "remove": "Remove",
-        "installed": "Downloaded", "not_installed": "Not downloaded", "verified": "Verified",
+        "apps": "App catalog", "no_apps": "No apps registered.",
+        "download": "Download source", "verify": "Verify source", "remove": "Remove source",
+        "installed": "Installed", "not_installed": "Not detected", "verified": "Source verified",
+        "source_downloaded": "Source downloaded", "no_source": "No source download",
+        "launch": "Open app", "install": "Install", "scan": "Detect installed apps",
+        "install_command": "Installation command", "manual_install": "Install manually on this platform, then link the executable.",
+        "manager_missing": "Required package manager is unavailable:",
+        "link": "Link existing app", "link_prompt": "Full path to the installed app executable:",
+        "getting_started": "Start here", "getting_started_text": "Detect apps already installed on this computer. If one is missing, link its executable or view its installation command. Source downloads are optional.",
+        "summary": "{installed} installed apps · {sources} source downloads", "version": "Version",
+        "install_hint": "Install from a terminal: python rlayers.py install",
         "system_p": "Protected", "removable_p": "Removable",
-        "locked_hint": "Protected app. Remove it from the terminal with force=True.",
-        "confirm_remove": "Remove {n}?", "working": "Working:", "log_title": "Last result",
+        "locked_hint": "Protected source. Remove from a terminal with --force.",
+        "confirm_remove": "Remove the managed source files for {n}?", "working": "Working:", "log_title": "Last result",
     },
     "ar": {
         "title": "R-Layers", "subtitle": "مدير الحزم والتطبيقات",
         "language": "اللغة", "auto": "حسب النظام",
         "kernel": "النواة", "arch": "المعمارية", "syslang": "لغة النظام",
         "translation": "الترجمة",
-        "mode_translated": "تمت الترجمة تلقائياً",
-        "apps": "التطبيقات المضمّنة", "no_apps": "لا توجد تطبيقات مسجّلة. شغّل python3 layer.py أولاً.",
-        "download": "تنزيل", "verify": "تحقق", "remove": "حذف",
-        "installed": "منزّل", "not_installed": "غير منزّل", "verified": "تم التحقق",
+        "mode_translated": "ترجمة متوفرة",
+        "apps": "دليل التطبيقات", "no_apps": "لا توجد تطبيقات مسجّلة.",
+        "download": "تنزيل المصدر", "verify": "فحص المصدر", "remove": "حذف المصدر",
+        "installed": "مثبّت", "not_installed": "لم يُكتشف", "verified": "تم فحص المصدر",
+        "source_downloaded": "المصدر منزّل", "no_source": "المصدر غير منزّل",
+        "launch": "فتح التطبيق", "install": "تثبيت", "scan": "اكتشاف التطبيقات المثبّتة",
+        "install_command": "عرض أمر التثبيت", "manual_install": "ثبّت التطبيق يدويًا لهذا النظام، ثم اربط ملف تشغيله.",
+        "manager_missing": "مدير الحزم المطلوب غير متوفر:",
+        "link": "ربط تطبيق موجود", "link_prompt": "المسار الكامل لملف تشغيل التطبيق المثبّت:",
+        "getting_started": "ابدأ من هنا", "getting_started_text": "اكتشف التطبيقات المثبّتة على جهازك. إذا لم يظهر تطبيق، اربط ملف تشغيله أو اعرض أمر تثبيته. تنزيل الكود المصدري اختياري.",
+        "summary": "التطبيقات المثبّتة: {installed} · المصادر المنزّلة: {sources}", "version": "الإصدار",
+        "install_hint": "للتثبيت من الطرفية: python rlayers.py install",
         "system_p": "محمي", "removable_p": "قابل للحذف",
-        "locked_hint": "تطبيق محمي. احذفه من الطرفية باستخدام force=True.",
-        "confirm_remove": "حذف {n}؟", "working": "جارٍ التنفيذ:", "log_title": "آخر نتيجة",
+        "locked_hint": "المصدر محمي. حذفه من الطرفية يتطلب --force.",
+        "confirm_remove": "حذف ملفات المصدر المُدارة لتطبيق {n}؟", "working": "جارٍ التنفيذ:", "log_title": "آخر نتيجة",
     },
 }
- 
- 
+
+
 def detect_system():
     raw = ""
     for var in ("LC_ALL", "LC_MESSAGES", "LANGUAGE", "LANG"):
         if os.environ.get(var):
             raw = os.environ[var]
             break
-    code = raw.split(":")[0].split(".")[0].split("_")[0].lower()
+    if not raw:
+        raw = locale.getlocale()[0] or "en"
+    code = re.split(r"[_\-.@]", raw.split(":")[0])[0].lower()
     if code in ("", "c", "posix"):
         code = "en"
     return {"kernel": platform.system(), "release": platform.release(),
             "machine": platform.machine(), "lang": code}
- 
- 
+
+
 def load_strings(code):
     """Return (strings, mode): mode is none, translated or fallback."""
+    if not re.fullmatch(r"[a-z]{2,3}", code):
+        code = "en"
     strings = dict(STRINGS["en"])
     if code == "en":
         return strings, "none"
     table = dict(STRINGS.get(code, {}))
-    extra = Path("locales") / f"{code}.json"
+    extra = Path(__file__).resolve().parent / "locales" / f"{code}.json"
     if extra.exists():
         try:
-            table.update(json.loads(extra.read_text(encoding="utf-8")))
+            values = json.loads(extra.read_text(encoding="utf-8"))
+            if isinstance(values, dict):
+                table.update({key: value for key, value in values.items() if key in strings and isinstance(value, str)})
         except (OSError, ValueError):
             pass
     if not table:
         return strings, "fallback"
     strings.update(table)
     return strings, "translated"
- 
- 
+
+
 def state(lang=""):
     system = detect_system()
     code = lang or system["lang"]
+    if not re.fullmatch(r"[a-z]{2,3}", code):
+        code = "en"
     strings, mode = load_strings(code)
-    with LOCK:
-        layer.packages = layer._load_cache()  # pick up terminal-side changes
-        apps = [{"name": n, "license": i.get("license", ""), "credit": i.get("credit_to", ""),
-                 "protection": i.get("protection", "removable"),
-                 "installed": bool(i.get("installed")), "verified": bool(i.get("verified")),
-                 "commit": (i.get("commit") or "")[:7]}
-                for n, i in layer.packages.items() if i.get("type") == "bundled_app"]
-    return {"system": system, "lang": code, "mode": mode, "rtl": code in RTL,
+    packages = get_layer().snapshot()
+    apps = [{"name": n, "license": i.get("license", ""), "credit": i.get("credit_to", ""),
+             "protection": i.get("protection", "removable"),
+             "installed": bool(i.get("installed")), "verified": bool(i.get("verified")),
+             "source_downloaded": bool(i.get("source_downloaded")),
+             "executable": i.get("executable", ""),
+             "installation": app_runtime.installation_status(n),
+             "commit": (i.get("commit") or "")[:7]}
+            for n, i in packages.items() if i.get("type") == "bundled_app"]
+    return {"version": __version__, "system": system, "lang": code, "mode": mode, "rtl": code in RTL,
             "t": strings, "apps": apps}
- 
- 
+
+
 PAGE = r"""<!doctype html>
 <html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -125,7 +164,7 @@ h2{font-size:15px;margin:24px 0 8px}
 select,button{font:inherit;color:inherit}
 select{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:6px 10px}
 .sys{display:flex;flex-wrap:wrap;gap:6px 28px;padding:12px 14px;background:var(--panel);border:1px solid var(--line);border-radius:6px}
-.app{display:grid;grid-template-columns:1fr auto;gap:8px 16px;align-items:center;background:var(--panel);border:1px solid var(--line);border-inline-start:5px solid var(--acc);padding:12px 14px;margin-bottom:8px;border-radius:6px}
+.app{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.2fr);gap:8px 16px;align-items:center;background:var(--panel);border:1px solid var(--line);border-inline-start:5px solid var(--acc);padding:12px 14px;margin-bottom:8px;border-radius:6px}
 .app.removable{border-inline-start:5px dashed var(--mute)}
 .name{font-weight:600;font-size:16px}
 .meta{color:var(--mute);font-size:13px}
@@ -139,7 +178,9 @@ button:disabled{opacity:.5;cursor:wait}
 button:focus-visible,select:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
 .lock{color:var(--mute);font-size:13px;max-width:230px}
 pre{direction:ltr;text-align:left;white-space:pre-wrap;background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:12px 14px;min-height:64px;margin:0}
-@media (max-width:560px){.app{grid-template-columns:1fr}}
+.guide{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:14px;margin-top:16px}
+.guide h2{margin:0 0 6px}.guide p{margin:0 0 10px}#summary{margin:10px 0;color:var(--mute)}
+@media (max-width:700px){.app{grid-template-columns:1fr}}
 </style></head>
 <body><main>
 <header>
@@ -147,19 +188,23 @@ pre{direction:ltr;text-align:left;white-space:pre-wrap;background:var(--panel);b
   <label class="sub"><span id="lang-label"></span> <select id="lang"></select></label>
 </header>
 <div class="sys" id="sys"></div>
-<h2 id="apps-title"></h2><div id="list"></div>
+<section class="guide"><h2 id="guide-title"></h2><p id="guide-text"></p><button id="scan" class="primary"></button></section>
+<h2 id="apps-title"></h2><p id="summary" aria-live="polite"></p><div id="list"></div>
 <h2 id="log-title"></h2><pre id="log"></pre>
 </main>
 <script>
 const TOKEN="__TOKEN__";
-let S, forced="", busy=false;
+let S, forced=new URLSearchParams(location.search).get("lang")||"", busy=false;
 const $=id=>document.getElementById(id);
 function el(tag,props,...kids){const e=document.createElement(tag);Object.assign(e,props||{});e.append(...kids);return e}
 function btn(label,fn,cls){return el("button",{textContent:label,className:cls,onclick:fn})}
- 
+
 async function load(){
-  const r=await fetch("/api/state"+(forced?"?lang="+encodeURIComponent(forced):""));
-  S=await r.json();render();
+  try{
+    const r=await fetch("/api/state"+(forced?"?lang="+encodeURIComponent(forced):""));
+    const d=await r.json();if(!r.ok)throw new Error(d.error||"Request failed");
+    S=d;render();
+  }catch(e){$("log").textContent=String(e)}
 }
 function render(){
   const t=S.t, sys=S.system;
@@ -172,56 +217,75 @@ function render(){
     .map(([v,l])=>el("option",{value:v,textContent:l,selected:v===forced})));
   const kv=(k,v)=>el("span",{},el("b",{textContent:k+": "}),v);
   $("sys").replaceChildren(kv(t.kernel,sys.kernel+" "+sys.release),kv(t.arch,sys.machine),
-    kv(t.syslang,sys.lang),kv(t.translation,t["mode_"+S.mode]));
+    kv(t.syslang,sys.lang),kv(t.translation,t["mode_"+S.mode]),kv(t.version,S.version));
+  $("guide-title").textContent=t.getting_started;$("guide-text").textContent=t.getting_started_text;
+  $("summary").textContent=t.summary.replace("{installed}",S.apps.filter(a=>a.installed).length).replace("{sources}",S.apps.filter(a=>a.source_downloaded).length);
   $("apps-title").textContent=t.apps;
   $("log-title").textContent=t.log_title;
+  $("scan").textContent=t.scan;$("scan").disabled=busy;
   $("list").replaceChildren(...(S.apps.length?S.apps.map(row):[el("p",{className:"sub",textContent:t.no_apps})]));
 }
 function row(a){
   const t=S.t, locked=a.protection==="system";
   const tags=[el("span",{className:"tag",textContent:a.license}),
-              el("span",{className:"tag",textContent:a.installed?t.installed:t.not_installed})];
+              el("span",{className:"tag",textContent:a.installed?t.installed:t.not_installed}),
+              el("span",{className:"tag",textContent:a.source_downloaded?t.source_downloaded:t.no_source})];
   if(a.verified)tags.push(el("span",{className:"tag ok",textContent:t.verified}));
   tags.push(el("span",{className:"meta",textContent:locked?t.system_p:t.removable_p}));
   if(a.commit)tags.push(el("span",{className:"meta",textContent:a.commit}));
   const acts=el("div",{className:"row"});
-  acts.append(a.installed?btn(t.verify,()=>act("verify",a.name),""):btn(t.download,()=>act("download",a.name),"primary"));
-  acts.append(locked?el("span",{className:"lock",textContent:t.locked_hint}):btn(t.remove,()=>act("remove",a.name),"danger"));
+  if(a.installed)acts.append(btn(t.launch,()=>act("launch",a.name),"primary"));
+  else{
+    acts.append(btn(t.link,()=>{const path=prompt(t.link_prompt);if(path&&path.trim())act("link",a.name,path.trim())},""));
+    if(a.installation.supported)acts.append(btn(t.install_command,()=>{
+      $("log").textContent=(a.installation.available?"":t.manager_missing+" "+a.installation.manager+"\n")+t.install_hint+" "+JSON.stringify(a.name)
+    },""));
+    else acts.append(el("span",{className:"lock",textContent:t.manual_install}));
+  }
+  acts.append(a.source_downloaded?btn(t.verify,()=>act("verify",a.name),""):btn(t.download,()=>act("download",a.name),""));
+  if(a.source_downloaded)acts.append(locked?el("span",{className:"lock",textContent:t.locked_hint}):btn(t.remove,()=>act("remove",a.name),"danger"));
   return el("div",{className:"app "+(locked?"system":"removable")},
     el("div",{},el("div",{className:"name",textContent:a.name}),el("div",{className:"meta",textContent:a.credit}),el("div",{className:"row"},...tags)),acts);
 }
-async function act(action,name){
-  if(busy)return;
+async function act(action,name,executable=""){
+  if(busy||!S)return;
   if(action==="remove"&&!confirm(S.t.confirm_remove.replace("{n}",name)))return;
   busy=true;document.querySelectorAll("button").forEach(b=>b.disabled=true);
   $("log").textContent=S.t.working+" "+action+" "+name;
   try{
     const r=await fetch("/api/action",{method:"POST",headers:{"Content-Type":"application/json","X-Token":TOKEN},
-      body:JSON.stringify({action,name})});
+      body:JSON.stringify({action,name,executable})});
     const d=await r.json();$("log").textContent=d.log||d.error||"";
   }catch(e){$("log").textContent=String(e)}
-  busy=false;load();
+  busy=false;await load();document.querySelectorAll("button").forEach(b=>b.disabled=false);
 }
 $("lang").onchange=e=>{forced=e.target.value;load()};
+$("scan").onclick=()=>act("scan","");
 load();
 </script></body></html>"""
- 
- 
+
+
 class Handler(BaseHTTPRequestHandler):
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(15)
+
     def log_message(self, *args):
         pass
- 
+
     def _send(self, code, body, ctype="application/json; charset=utf-8"):
         data = body.encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(data)
- 
+
     def _local(self):
         return self.headers.get("Host", "").split(":")[0] in ("127.0.0.1", "localhost")
- 
+
     def do_GET(self):
         if not self._local():
             return self._send(403, "forbidden", "text/plain")
@@ -230,43 +294,75 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, PAGE.replace("__TOKEN__", TOKEN), "text/html; charset=utf-8")
         if url.path == "/api/state":
             lang = parse_qs(url.query).get("lang", [""])[0][:8]
-            return self._send(200, json.dumps(state(lang), ensure_ascii=False))
+            try:
+                return self._send(200, json.dumps(state(lang), ensure_ascii=False))
+            except (RegistryError, OSError, ValueError) as exc:
+                return self._send(503, json.dumps({"error": str(exc)}))
         self._send(404, "not found", "text/plain")
- 
+
     def do_POST(self):
         if not self._local() or self.headers.get("X-Token") != TOKEN:
             return self._send(403, json.dumps({"error": "forbidden"}))
+        origin = self.headers.get("Origin")
+        if origin and origin not in (f"http://127.0.0.1:{self.server.server_port}", f"http://localhost:{self.server.server_port}"):
+            return self._send(403, json.dumps({"error": "forbidden origin"}))
         if self.path != "/api/action":
             return self._send(404, json.dumps({"error": "not found"}))
         try:
-            size = min(int(self.headers.get("Content-Length", 0)), 4096)
+            size = int(self.headers.get("Content-Length", 0))
+            if not 0 < size <= 4096:
+                return self._send(413, json.dumps({"error": "request body must be 1 to 4096 bytes"}))
             req = json.loads(self.rfile.read(size))
             action, name = req["action"], req["name"]
+            if not isinstance(action, str) or not isinstance(name, str):
+                raise ValueError("action and name must be strings")
+            executable = req.get("executable", "")
+            if not isinstance(executable, str):
+                raise ValueError("executable must be a string")
         except (ValueError, KeyError, TypeError):
             return self._send(400, json.dumps({"error": "bad request"}))
-        funcs = {"download": layer.download_app, "verify": layer.verify_app, "remove": layer.remove_app}
+        try:
+            manager = get_layer()
+        except (RegistryError, OSError, ValueError) as exc:
+            return self._send(503, json.dumps({"error": str(exc)}))
+        funcs = {"download": manager.download_app, "verify": manager.verify_app,
+                 "remove": manager.remove_app, "launch": manager.launch_app,
+                 "scan": manager.scan_apps, "link": manager.link_app}
         buf = io.StringIO()
-        with LOCK:
-            layer.packages = layer._load_cache()
-            if action not in funcs or name not in layer.packages:
-                return self._send(400, json.dumps({"error": "unknown action or app"}))
+        if action not in funcs:
+            return self._send(400, json.dumps({"error": "unknown action"}))
+        if not LOCK.acquire(blocking=False):
+            return self._send(409, json.dumps({"error": "another browser action is busy"}))
+        try:
             with contextlib.redirect_stdout(buf):
                 try:
-                    # force is never passed from the browser: protected apps stay terminal-only
-                    ok = funcs[action](name)
+                    if action == "scan":
+                        ok = funcs[action]()
+                    elif action == "link":
+                        ok = funcs[action](name, executable)
+                    else:
+                        ok = funcs[action](name)
                 except Exception as exc:  # report instead of crashing the server
                     ok = False
                     print(f"Error: {exc}")
-        self._send(200, json.dumps({"ok": bool(ok), "log": buf.getvalue().strip()}, ensure_ascii=False))
- 
- 
+        finally:
+            LOCK.release()
+        self._send(200 if ok else 400, json.dumps({"ok": bool(ok), "log": buf.getvalue().strip()}, ensure_ascii=False))
+
+
 if __name__ == "__main__":
-    server = ThreadingHTTPServer((HOST, PORT), Handler)
-    url = f"http://{HOST}:{PORT}"
-    print(f"R-Layers UI running at {url} (Ctrl+C to stop)")
-    threading.Timer(0.5, lambda: webbrowser.open(url)).start()
     try:
-        server.serve_forever()
+        get_layer()
+        with ThreadingHTTPServer((HOST, PORT), Handler) as server:
+            url = f"http://{HOST}:{PORT}"
+            print(f"R-Layers UI running at {url} (Ctrl+C to stop)")
+            timer = threading.Timer(0.5, lambda: webbrowser.open(url))
+            timer.daemon = True
+            timer.start()
+            server.serve_forever()
     except KeyboardInterrupt:
         print()
- 
+    except (OSError, RegistryError, ValueError) as exc:
+        print(f"Error: {exc}")
+        raise SystemExit(1)
+

@@ -1,14 +1,23 @@
-import json
+"""R-Layers source registry and desktop app management."""
+import functools
+import logging
 import os
-import subprocess
+import re
 import shutil
+import subprocess
+import tempfile
+import threading
+from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from datetime import datetime
 from urllib.parse import urlparse
- 
+
+import app_runtime
+from storage import RegistryError, RegistryStore
+
+PROJECT_DIR = Path(__file__).resolve().parent
+DEFAULT_CACHE = PROJECT_DIR / "pkg_cache"
 ALLOWED_HOSTS = {"github.com"}
- 
-# Apps shipped with R-Layers: (name, source, license, credit, protection)
 APPS = [
     ("Nautilus", "https://github.com/GNOME/nautilus", "GPL-3.0", "GNOME Project", "system"),
     ("Joplin", "https://github.com/laurent22/joplin", "AGPL-3.0", "Laurent Cozic and Joplin Contributors", "system"),
@@ -19,327 +28,419 @@ APPS = [
     ("VLC", "https://github.com/videolan/vlc", "GPL-2.0", "VideoLAN Organization", "removable"),
     ("Blender", "https://github.com/blender/blender", "GPL-2.0", "Blender Foundation", "removable"),
 ]
- 
-# Entries dropped from the catalog; they are removed from the registry on the next run
 RETIRED = ["World Clock"]
- 
- 
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def operation(method):
+    """Serialize complete mutations across CLI/web processes and reload stale state."""
+    @functools.wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._operation_lock:
+            self.last_error = ""
+            try:
+                with self.store.locked():
+                    self.packages = self.store.read()
+                    if self._migrate():
+                        self._save_cache()
+                    result = method(self, *args, **kwargs)
+                    self.logger.info("%s %s: %s", method.__name__, args[:1], bool(result))
+                    return result
+            except (OSError, ValueError, RegistryError, subprocess.SubprocessError) as exc:
+                self.last_error = str(exc)
+                if isinstance(exc, subprocess.CalledProcessError) and exc.stderr:
+                    self.last_error += "\n" + exc.stderr.strip()[-2000:]
+                self.logger.exception("%s failed", method.__name__)
+                print(f"Error: {self.last_error}")
+                return False
+    return wrapped
+
+
 class PackageAbstractionLayer:
-    """A layer that reads packages and stores them in a cache."""
- 
-    def __init__(self, cache_dir="./pkg_cache"):
-        self.cache_dir = Path(cache_dir)
-        self.cache_dir.mkdir(exist_ok=True)
-        self.cache_file = self.cache_dir / "packages.json"
-        self.packages = self._load_cache()
- 
+    def __init__(self, cache_dir=None):
+        self.store = RegistryStore(cache_dir or os.environ.get("RLAYERS_CACHE_DIR") or DEFAULT_CACHE)
+        self.cache_dir = self.store.directory
+        self.cache_file = self.store.path
+        self.apps_dir = self.cache_dir / "apps"
+        self._operation_lock = threading.RLock()
+        self.last_error = ""
+        self.logger = logging.getLogger(f"rlayers.{self.cache_dir}")
+        self.logger.setLevel(logging.INFO)
+        self.logger.propagate = False
+        if not self.logger.handlers:
+            handler = RotatingFileHandler(self.cache_dir / f"rlayers-{os.getpid()}.log", maxBytes=1_000_000, backupCount=2, encoding="utf-8")
+            handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+            self.logger.addHandler(handler)
+        with self.store.locked():
+            self.packages = self.store.read()
+            if self._migrate():
+                self._save_cache()
+
+    @staticmethod
+    def _validate_name(name):
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 _.-]{0,79}", name):
+            raise ValueError("Invalid package name. Use letters, digits, spaces, dots, underscores or hyphens.")
+        reserved = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+        if name.endswith((".", " ")) or name.split(".")[0].upper() in reserved:
+            raise ValueError("Package name is reserved or ambiguous on Windows.")
+
+    @staticmethod
+    def _validate_url(url):
+        parsed = urlparse(url)
+        if (parsed.scheme != "https" or parsed.hostname not in ALLOWED_HOSTS
+                or parsed.username or parsed.password or parsed.port not in (None, 443)
+                or parsed.query or parsed.fragment
+                or not re.fullmatch(r"/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/?", parsed.path)):
+            raise ValueError("Source must be an HTTPS GitHub repository URL.")
+
+    def _migrate(self):
+        changed = False
+        for name, info in self.packages.items():
+            self._validate_name(name)
+            if info.get("type") == "bundled_app" and "source_downloaded" not in info:
+                info["source_downloaded"] = bool(info.get("installed") and info.get("local_path"))
+                info["installed"] = False
+                info["verified"] = False
+                changed = True
+        for name, url, license_name, credit, protection in APPS:
+            info = self.packages.setdefault(name, {"type": "bundled_app", "added_at": now()})
+            metadata = {"type": "bundled_app", "license": license_name, "credit_to": credit, "protection": protection}
+            if not info.get("source_downloaded") or not info.get("source_url"):
+                metadata["source_url"] = url
+            for field, value in metadata.items():
+                if info.get(field) != value:
+                    info[field] = value
+                    changed = True
+        return changed
+
     def _load_cache(self):
-        """Load packages from cache if it exists."""
-        if self.cache_file.exists():
-            with open(self.cache_file, 'r') as f:
-                return json.load(f)
-        return {}
- 
+        return self.store.read()
+
     def _save_cache(self):
-        """Save packages to cache."""
-        with open(self.cache_file, 'w') as f:
-            json.dump(self.packages, f, indent=2)
- 
+        self.store.write(self.packages)
+
+    def snapshot(self):
+        return self.store.read()
+
+    def close(self):
+        for handler in self.logger.handlers[:]:
+            handler.close()
+            self.logger.removeHandler(handler)
+
+    def _app_path(self, name):
+        self._validate_name(name)
+        if self.apps_dir.resolve() != self.cache_dir / "apps":
+            raise ValueError("The apps directory must not redirect outside its cache.")
+        path = self.apps_dir / name
+        if path.resolve() != path:
+            raise ValueError(f"Refusing redirected app path: {path}")
+        return path
+
+    def _recorded_path(self, name, info):
+        expected = self._app_path(name)
+        value = info.get("local_path")
+        if not value:
+            return expected
+        path = Path(value)
+        if not path.is_absolute():
+            path = PROJECT_DIR / path
+        if path.resolve() != expected:
+            raise ValueError(f"Refusing source path outside its managed app directory: {path}")
+        return expected
+
+    def _app(self, name):
+        self._validate_name(name)
+        info = self.packages.get(name)
+        if not info or info.get("type") != "bundled_app":
+            raise ValueError(f"'{name}' is not a registered app")
+        return info
+
+    @staticmethod
+    def _git(path, *args):
+        return subprocess.run(["git", "-C", str(path), *args], check=True, capture_output=True,
+                              text=True, encoding="utf-8", errors="replace", timeout=120).stdout.strip()
+
+    def _inspect_source(self, name, info):
+        path = self._recorded_path(name, info)
+        if not path.is_dir() or not (path / ".git").is_dir() or (path / ".git").resolve() != path / ".git":
+            raise ValueError(f"No managed Git source found for '{name}'")
+        if Path(self._git(path, "rev-parse", "--show-toplevel")).resolve() != path:
+            raise ValueError("Git repository root does not match the app directory")
+        commit = self._git(path, "rev-parse", "HEAD")
+        if not info.get("commit") or commit != info["commit"]:
+            raise ValueError(f"'{name}' commit does not match the recorded download")
+        flags = self._git(path, "ls-files", "-v").splitlines()
+        if any(line and (line[0].islower() or line[0] == "S") for line in flags):
+            raise ValueError("Cannot verify files hidden by assume-unchanged or skip-worktree index flags")
+        if self._git(path, "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none"):
+            raise ValueError(f"'{name}' contains modified, deleted, staged or untracked files")
+        self._git(path, "fsck", "--no-dangling")
+        return commit
+
+    @operation
     def add_package(self, name, version, dependencies=None):
-        """Add a new package."""
-        if name in self.packages:
+        self._validate_name(name)
+        dependencies = dependencies or []
+        if not isinstance(dependencies, list):
+            raise ValueError("Dependencies must be a list of package names")
+        for dep in dependencies:
+            self._validate_name(dep)
+        if any(known.casefold() == name.casefold() for known in self.packages):
             print(f"Package {name} already exists")
             return False
- 
-        self.packages[name] = {
-            "version": version,
-            "dependencies": dependencies or [],
-            "added_at": datetime.now().isoformat(),
-            "cached": True
-        }
+        self.packages[name] = {"version": str(version), "dependencies": dependencies, "added_at": now(), "cached": True}
         self._save_cache()
         print(f"Package {name} v{version} added successfully")
         return True
- 
+
     def get_package(self, name):
-        """Get a package from cache."""
-        if name in self.packages:
-            print(f"Loading {name} from cache...")
-            return self.packages[name]
-        print(f"Package {name} not found")
-        return None
- 
+        return self.snapshot().get(name)
+
     def package_exists(self, name):
-        """Check if a package is already cached."""
-        return name in self.packages
- 
+        return name in self.snapshot()
+
+    @operation
     def add_bundled_app(self, name, source_url, license_name, credit_to, protection="removable"):
-        """Register an open-source app to be bundled, with attribution.
- 
-        protection:
-          - "removable" (default): can be deleted normally, e.g. a browser.
-          - "system": protected app, e.g. a file manager. Can only be
-            removed by explicitly calling remove_app(name, force=True)
-            from the terminal.
-        """
-        if name in self.packages:
+        self._validate_name(name)
+        self._validate_url(source_url)
+        if protection not in ("system", "removable"):
+            raise ValueError("Protection must be 'system' or 'removable'")
+        if any(known.casefold() == name.casefold() for known in self.packages):
             print(f"App {name} already registered")
             return False
- 
-        if protection not in ("removable", "system"):
-            print(f"Invalid protection level '{protection}', must be 'removable' or 'system'")
-            return False
- 
-        self.packages[name] = {
-            "type": "bundled_app",
-            "source_url": source_url,
-            "license": license_name,
-            "credit_to": credit_to,
-            "protection": protection,
-            "added_at": datetime.now().isoformat()
-        }
+        self.packages[name] = {"type": "bundled_app", "source_url": source_url, "license": license_name,
+                               "credit_to": credit_to, "protection": protection, "added_at": now()}
         self._save_cache()
-        print(f"App {name} registered (credit: {credit_to}, protection: {protection})")
         return True
- 
+
     def print_credits(self):
-        """Print attribution for all bundled apps."""
         print("\nCredits:")
-        for name, info in self.packages.items():
+        for name, info in self.snapshot().items():
             if info.get("type") == "bundled_app":
-                print(f"  {name} — by {info['credit_to']} ({info['license']})")
-                print(f"    Source: {info['source_url']}")
- 
-    def download_app(self, name, apps_dir="pkg_cache/apps", timeout=1800):
-        """Clone a bundled app's repo and update its record."""
-        if name not in self.packages:
-            print(f"'{name}' not registered")
-            return False
- 
-        info = self.packages[name]
-        if info.get("type") != "bundled_app":
-            print(f"'{name}' is not a bundled app")
-            return False
- 
-        url = info.get("source_url", "")
-        host = urlparse(url).hostname or ""
-        if urlparse(url).scheme != "https" or host not in ALLOWED_HOSTS:
-            print(f"Refusing to clone from untrusted URL: {url}")
-            return False
- 
-        dest = Path(apps_dir) / name
-        if (dest / ".git").exists():
-            print(f"'{name}' already downloaded at {dest}")
-            return True
-        self._rmtree(dest)  # leftover of an interrupted clone
- 
-        Path(apps_dir).mkdir(parents=True, exist_ok=True)
-        print(f"Downloading '{name}' (large projects can take several minutes)...", flush=True)
- 
-        # never wait for a password prompt: a wrong link must fail fast
-        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
-        try:
-            subprocess.run(
-                ["git", "-c", "core.longpaths=true", "clone", "--depth", "1", "--", url, str(dest)],
-                check=True,
-                timeout=timeout,
-                capture_output=True,
-                text=True,
-                env=env,
-            )
-        except subprocess.CalledProcessError as e:
-            print(f"Clone failed for '{name}': {e.stderr.strip()}")
-            self._rmtree(dest)
-            return False
-        except subprocess.TimeoutExpired:
-            print(f"Clone timed out for '{name}' after {timeout} seconds")
-            self._rmtree(dest)
-            return False
-        except FileNotFoundError:
-            print("git is not installed (Kali/Debian: sudo apt install git)")
-            return False
- 
-        commit_hash = subprocess.run(
-            ["git", "-C", str(dest), "rev-parse", "HEAD"],
-            capture_output=True, text=True, check=True
-        ).stdout.strip()
- 
-        info["local_path"] = str(dest)
-        info["commit"] = commit_hash
-        info["installed"] = True
+                print(f"  {name} — by {info.get('credit_to', '')} ({info.get('license', '')})")
+                print(f"    Source: {info.get('source_url', '')}")
+
+    @operation
+    def download_app(self, name, apps_dir=None, timeout=1800):
+        info = self._app(name)
+        self._validate_url(info.get("source_url", ""))
+        if apps_dir is not None and Path(apps_dir).resolve() != self.apps_dir:
+            raise ValueError("Downloads must stay in this registry's apps directory")
+        dest = self._app_path(name)
+        if dest.exists():
+            if not info.get("commit"):
+                raise ValueError(f"Unregistered files exist at {dest}; move them aside before downloading.")
+            info["verified"] = False
+            self._save_cache()
+            commit = self._inspect_source(name, info)
+        else:
+            self.apps_dir.mkdir(parents=True, exist_ok=True)
+            staging = Path(tempfile.mkdtemp(prefix=f".download-{name}-", dir=self.apps_dir))
+            print(f"Downloading source for '{name}'...", flush=True)
+            try:
+                subprocess.run(["git", "-c", "core.longpaths=true", "clone", "--depth", "1", "--",
+                                info["source_url"], str(staging)], check=True, capture_output=True,
+                               text=True, encoding="utf-8", errors="replace", timeout=timeout,
+                               env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+                commit = self._git(staging, "rev-parse", "HEAD")
+                staging.rename(dest)
+            finally:
+                if staging.exists():
+                    self._rmtree(staging)
+        info.update(local_path=str(dest), commit=commit, source_downloaded=True, verified=False)
         self._save_cache()
-        print(f"'{name}' downloaded to {dest} (commit {commit_hash[:7]})")
+        print(f"Source downloaded: {dest} ({commit[:7]}). Use install or link to run the app.")
         return True
- 
-    def download_all(self, apps_dir="pkg_cache/apps"):
-        """Download every registered bundled app, one after the other."""
-        names = [n for n, i in self.packages.items() if i.get("type") == "bundled_app"]
-        done, failed = [], []
-        for number, name in enumerate(names, 1):
-            print(f"\n[{number}/{len(names)}] {name}")
-            (done if self.download_app(name, apps_dir) else failed).append(name)
-        print(f"\nDownloaded: {len(done)}   Failed: {len(failed)}")
-        if failed:
-            print("Failed: " + ", ".join(failed))
-        return not failed
- 
+
+    def download_all(self, apps_dir=None):
+        names = [name for name, info in self.snapshot().items() if info.get("type") == "bundled_app"]
+        results = [self.download_app(name, apps_dir) for name in names]
+        count = sum(map(bool, results))
+        print(f"Downloaded: {count}; failed: {len(results) - count}")
+        return all(results)
+
+    @operation
     def update_source(self, name, new_url):
-        """Fix the source link of a registered app that is not downloaded yet."""
-        info = self.packages.get(name)
-        if not info or info.get("type") != "bundled_app" or info.get("source_url") == new_url:
-            return False
-        if info.get("installed"):
-            print(f"'{name}' is already downloaded; remove it first to change its source")
-            return False
+        self._validate_url(new_url)
+        info = self._app(name)
+        if info.get("source_downloaded"):
+            raise ValueError("Remove the managed source before changing its URL")
+        if name in {app[0] for app in APPS}:
+            raise ValueError("Built-in source URLs are maintained by the catalog")
         info["source_url"] = new_url
         self._save_cache()
-        print(f"'{name}' source updated to {new_url}")
         return True
- 
+
+    @operation
     def verify_app(self, name):
-        """Verify a downloaded app is intact and matches the recorded commit."""
-        if name not in self.packages:
-            print(f"'{name}' not registered")
-            return False
- 
-        info = self.packages[name]
-        local_path = info.get("local_path")
-        recorded_commit = info.get("commit")
- 
-        if not local_path or not Path(local_path).exists():
-            print(f"'{name}' local files not found at {local_path}")
-            return False
- 
-        if not (Path(local_path) / ".git").exists():
-            print(f"'{name}' does not have .git history (not a cloned repo)")
-            return False
- 
-        if not any(Path(local_path).iterdir()):
-            print(f"'{name}' folder is empty")
-            return False
- 
-        try:
-            current_commit = subprocess.run(
-                ["git", "-C", str(local_path), "rev-parse", "HEAD"],
-                capture_output=True, text=True, check=True
-            ).stdout.strip()
-        except subprocess.CalledProcessError as e:
-            print(f"Failed to verify commit for '{name}': {e.stderr.strip()}")
-            return False
- 
-        if current_commit != recorded_commit:
-            print(f"'{name}' commit mismatch: recorded {str(recorded_commit)[:7]}, "
-                  f"current {current_commit[:7]}")
-            return False
- 
-        info["verified"] = True
+        info = self._app(name)
+        info["verified"] = False
         self._save_cache()
-        print(f"\u2713 '{name}' verified successfully ({current_commit[:7]})")
+        commit = self._inspect_source(name, info)
+        info.update(verified=True, verified_at=now())
+        self._save_cache()
+        print(f"'{name}' source verified ({commit[:7]}): clean working tree and valid Git objects.")
         return True
- 
+
     @staticmethod
     def _force_remove_readonly(func, path, exc_info):
-        """Clear read-only flag (common in .git folders on Windows) and retry."""
-        os.chmod(path, 0o777)
+        os.chmod(path, 0o700)
         func(path)
- 
+
     def _rmtree(self, path):
-        """Delete a folder tree, including read-only git files. Does nothing if missing."""
-        if not Path(path).exists():
+        path = Path(path)
+        if path.resolve().parent != self.apps_dir or path.is_symlink():
+            raise ValueError(f"Refusing deletion outside the managed apps directory: {path}")
+        if not path.exists():
             return
         try:
-            shutil.rmtree(path, onexc=self._force_remove_readonly)  # Python 3.12+
+            shutil.rmtree(path, onexc=self._force_remove_readonly)
         except TypeError:
             shutil.rmtree(path, onerror=self._force_remove_readonly)
- 
+
+    @operation
     def remove_app(self, name, force=False):
-        """Remove a downloaded app's local files and registration.
- 
-        System-protected apps (protection='system') require force=True
-        to be removed. Removable apps are deleted normally.
-        """
-        if name not in self.packages:
-            print(f"'{name}' not registered")
-            return False
- 
-        info = self.packages[name]
-        protection = info.get("protection", "removable")
- 
-        if protection == "system" and not force:
-            print(f"'{name}' is a protected system app and cannot be removed "
-                  f"without confirmation.")
-            print(f"To remove it, run: layer.remove_app('{name}', force=True)")
-            return False
- 
-        local_path = info.get("local_path")
-        if local_path and Path(local_path).exists():
-            self._rmtree(local_path)
-            print(f"Deleted files at {local_path}")
- 
-        del self.packages[name]
+        info = self._app(name)
+        if info.get("protection") == "system" and not force:
+            raise ValueError(f"'{name}' is protected. Use 'remove {name} --force' in the terminal.")
+        path = self._recorded_path(name, info)
+        if path.exists():
+            if not info.get("local_path"):
+                raise ValueError("Unregistered files occupy this app directory; refusing deletion")
+            self._rmtree(path)
+        for field in ("local_path", "commit", "verified_at"):
+            info.pop(field, None)
+        info.update(source_downloaded=False, verified=False)
         self._save_cache()
-        print(f"'{name}' removed from registry.")
+        print(f"Removed managed source for '{name}'. Its catalog entry and desktop installation are retained.")
         return True
- 
+
     def resolve_dependencies(self, package_name):
-        """Resolve dependencies automatically."""
-        if package_name not in self.packages:
+        packages = self.snapshot()
+        ordered, active, done = [], set(), set()
+
+        def visit(name):
+            if name not in packages:
+                raise ValueError(f"Missing dependency: {name}")
+            if name in active:
+                raise ValueError(f"Dependency cycle detected at: {name}")
+            if name in done:
+                return
+            active.add(name)
+            for dep in packages[name].get("dependencies", []):
+                visit(dep)
+            active.remove(name)
+            done.add(name)
+            ordered.append(name)
+
+        try:
+            visit(package_name)
+        except (ValueError, RecursionError) as exc:
+            print(f"Error: {exc}")
+            self.logger.warning("Dependency resolution failed: %s", exc)
             return None
- 
-        resolved = {package_name}
-        to_process = [package_name]
- 
-        while to_process:
-            current = to_process.pop(0)
-            deps = self.packages[current].get("dependencies", [])
- 
-            for dep in deps:
-                if dep not in resolved:
-                    resolved.add(dep)
-                    to_process.append(dep)
- 
-        print(f"Resolved dependencies for {package_name}:")
-        for pkg in resolved:
-            print(f"  - {pkg}")
- 
-        return resolved
- 
+        return ordered
+
     def list_packages(self):
-        """Display all packages."""
-        if not self.packages:
-            print("No packages found")
-            return
- 
-        print("\nAvailable packages:")
-        for name, info in self.packages.items():
+        for name, info in self.snapshot().items():
             print(f"  {name} v{info.get('version', 'N/A')}")
-            if info.get('dependencies'):
-                print(f"    Dependencies: {', '.join(info['dependencies'])}")
- 
- 
+
+    @operation
+    def scan_apps(self):
+        for name, info in self.packages.items():
+            if info.get("type") != "bundled_app":
+                continue
+            executable = None
+            if info.get("executable"):
+                try:
+                    executable = app_runtime.valid_executable(info["executable"])
+                except ValueError:
+                    pass
+            executable = executable or app_runtime.discover(name)
+            info["installed"] = bool(executable)
+            if executable:
+                info["executable"] = executable
+                print(f"Found {name}: {executable}")
+            else:
+                info.pop("executable", None)
+                print(f"Not detected: {name} (use link for a custom location)")
+        self._save_cache()
+        return True
+
+    @operation
+    def link_app(self, name, executable):
+        info = self._app(name)
+        info.update(executable=app_runtime.valid_executable(executable), installed=True)
+        self._save_cache()
+        print(f"Linked '{name}' to {info['executable']}")
+        return True
+
+    @operation
+    def install_app(self, name, dry_run=False):
+        info = self._app(name)
+        existing = info.get("executable")
+        if existing:
+            try:
+                app_runtime.valid_executable(existing)
+            except ValueError:
+                existing = None
+        existing = existing or app_runtime.discover(name)
+        if existing:
+            try:
+                executable = app_runtime.valid_executable(existing)
+            except ValueError:
+                executable = None
+            if executable:
+                if not dry_run:
+                    info.update(executable=executable, installed=True)
+                    self._save_cache()
+                print(f"Already installed: {executable}")
+                return True
+        command = app_runtime.install_command(name)
+        print("Install command: " + subprocess.list2cmdline(command))
+        if dry_run:
+            return True
+        if not shutil.which(command[0]):
+            raise ValueError(f"Package manager '{command[0]}' is unavailable. Install manually and use link.")
+        if command[0] == "apt-get" and hasattr(os, "geteuid") and os.geteuid() != 0:
+            raise ValueError("APT installation needs an administrator terminal. Run the displayed command with sudo, then scan.")
+        subprocess.run(command, check=True, timeout=1800)
+        executable = app_runtime.discover(name)
+        if not executable:
+            raise ValueError("Installer finished but executable was not detected. Use link with its actual path.")
+        info.update(executable=executable, installed=True)
+        self._save_cache()
+        return True
+
+    @operation
+    def launch_app(self, name):
+        info = self._app(name)
+        executable = info.get("executable") or app_runtime.discover(name)
+        if not executable:
+            raise ValueError("App executable not found. Use scan, link or install first.")
+        try:
+            executable = app_runtime.valid_executable(executable)
+        except ValueError:
+            info["installed"] = False
+            info.pop("executable", None)
+            self._save_cache()
+            raise
+        subprocess.Popen([executable], cwd=str(Path(executable).parent), stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, shell=False)
+        info.update(executable=executable, installed=True)
+        self._save_cache()
+        print(f"Launched '{name}'")
+        return True
+
+
 if __name__ == "__main__":
-    layer = PackageAbstractionLayer()
- 
-    layer.add_package("kernel", "6.1.0")
-    layer.add_package("gcc", "13.0", dependencies=["binutils"])
-    layer.add_package("binutils", "2.40")
-    layer.add_package("make", "4.3", dependencies=["gcc"])
- 
-    layer.list_packages()
- 
-    print("\n" + "="*50)
-    layer.resolve_dependencies("make")
- 
-    print("\n" + "="*50)
-    print("Registering apps...")
-    for name, url, license_name, credit, protection in APPS:
-        layer.add_bundled_app(name, url, license_name, credit, protection=protection)
-        layer.update_source(name, url)  # fixes a wrong link registered earlier
- 
-    for name in RETIRED:
-        if layer.package_exists(name):
-            layer.remove_app(name)
- 
-    layer.print_credits()
-    print("\nNext: python3 rlayers.py")
- 
+    try:
+        manager = PackageAbstractionLayer()
+        manager.print_credits()
+        print("\nNext: python rlayers.py")
+    except (RegistryError, OSError) as error:
+        print(f"Error: {error}")
+        raise SystemExit(1)

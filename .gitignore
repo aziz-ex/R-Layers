@@ -1,3 +1,5 @@
 pkg_cache/
 __pycache__/
 *.pyc
+dist/
+.venv/
