@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.3.0 — 2026-11-05
+
+### Added
+
+- Background web jobs for source downloads and verification, with Git progress, cancellation, browser polling, and recent-state persistence.
+- Cancellable Git downloads stop the child process and clean only their owned staging directory.
+- Arabic/English job status, failure details, and restart-interruption reporting.
+- Tests for job history, API submission, progress reporting, and cancellation cleanup.
+
+### Compatibility
+
+- CLI download and verification commands remain synchronous.
+- Native installer execution still needs manual validation on Windows, Linux, and macOS.
+
 ## 0.2.0 — 2026-10-30
 
 ### Added

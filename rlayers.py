@@ -254,6 +254,7 @@ def serve_web(lang="", open_browser=True):
         print()
     finally:
         server.server_close()
+        web.shutdown_jobs()
     return True
 
 

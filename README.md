@@ -1,6 +1,6 @@
 # R-Layers
 
-**Version 0.2.0** · [Download the latest release](https://github.com/aziz-ex/R-Layers/releases/latest) · [البداية بالعربية](QUICKSTART.ar.md) · [Roadmap](ROADMAP.md) · [Changelog](CHANGELOG.md)
+**Version 0.3.0** · [Download the latest release](https://github.com/aziz-ex/R-Layers/releases/latest) · [البداية بالعربية](QUICKSTART.ar.md) · [Roadmap](ROADMAP.md) · [Changelog](CHANGELOG.md)
 
 R-Layers manages a catalog of open-source desktop apps and their source repositories. It provides a local web interface and a terminal menu, with Arabic and English support.
 
@@ -80,7 +80,7 @@ python rlayers.py remove Flameshot --force
 python rlayers.py credits
 ```
 
-Downloads are shallow HTTPS clones from GitHub. They can be several GB for large apps. Downloads use a new staging directory and publish it only after Git succeeds. Existing unregistered files are preserved, and downloaded repositories are reused only after verification. Failed staging clones are cleaned up; interruption can leave a `.download-*` directory for manual inspection.
+Downloads are shallow HTTPS clones from GitHub. They can be several GB for large apps. In the web UI, download and verification jobs run in the background; progress and recent job results remain visible after a browser reload. Downloads show Git progress and can be cancelled. Cancellation stops Git and removes that job's staging directory. The CLI keeps its synchronous behavior. Downloads use a new staging directory and publish it only after Git succeeds. Existing unregistered files are preserved, and downloaded repositories are reused only after verification. A forced process termination can leave a `.download-*` directory for manual inspection.
 
 Verification checks the repository root, recorded commit, modified/deleted/staged/non-ignored untracked files, index flags that could hide modifications, and Git object integrity. A failure clears the previous verified flag. A verified badge records the last successful check; rerun verification after changing files. This checks source consistency, not publisher signatures or the installed desktop executable.
 
@@ -105,7 +105,7 @@ License labels below are catalog metadata for attribution. The downloaded upstre
 
 The default cache is `pkg_cache/` beside the Python sources, independent of the current working directory. Set `RLAYERS_CACHE_DIR` to an absolute directory to use an isolated registry. All managed source downloads stay inside that registry's `apps/` directory; redirected paths escaping it are rejected.
 
-Registry writes are atomic, retain the previous valid snapshot in `packages.json.bak`, and use an operating-system process lock shared by CLI/web operations. A long operation may hold the lock; another mutation times out with a busy message. Web state reads remain available. The cache is intended for a local filesystem.
+Registry writes are atomic, retain the previous valid snapshot in `packages.json.bak`, and use an operating-system process lock shared by CLI/web operations. Web job history is stored separately in `web-jobs.json`; active work is marked interrupted after a server restart. A long operation may hold the registry lock; other mutations report a busy state while a web job is active. Web state reads remain available. The cache is intended for a local filesystem.
 
 Legacy registries are migrated on startup: catalog licenses, credits, and protection levels are updated; the old `installed` flag becomes `source_downloaded`; installed executable detection is separate. Old HEAD-only verification badges are cleared. Source files are retained.
 
@@ -139,7 +139,7 @@ Dependency resolution returns dependency-first ordering, reports missing package
 python -m unittest discover -s tests -v
 ```
 
-Tests use temporary registries and local Git repositories, including real concurrent processes and HTTP requests. They do not download upstream apps, execute installers, or open desktop apps. Symlink checks skip if Windows does not grant symlink privileges.
+Tests use temporary registries and local Git repositories, including real concurrent processes and HTTP requests, background job persistence, and cancellation cleanup. They do not download upstream apps, execute installers, or open desktop apps. Symlink checks skip if Windows does not grant symlink privileges.
 
 GitHub Actions is configured for Windows, Linux, and macOS with Python 3.10 and 3.14. A configured workflow does not establish that those remote jobs have run. Actual desktop installation and launch still require manual checks on each target platform.
 
@@ -149,14 +149,14 @@ GitHub Actions is configured for Windows, Linux, and macOS with Python 3.10 and 
 python scripts/build_release.py
 ```
 
-This creates `dist/R-Layers-0.2.0.zip` and its `.sha256` checksum from an explicit allowlist. The ZIP excludes the cache, downloaded app sources, logs, credentials, and machine-specific installations. It includes the Python sources, tests, license, and guides. Identical input bytes produce identical archives. The release tests also unpack the ZIP and check that it runs independently of the working directory.
+This creates `dist/R-Layers-0.3.0.zip` and its `.sha256` checksum from an explicit allowlist. The ZIP excludes the cache, downloaded app sources, logs, credentials, and machine-specific installations. It includes the Python sources, tests, license, and guides. Identical input bytes produce identical archives. The release tests also unpack the ZIP and check that it runs independently of the working directory.
 
 | Component | Implemented status |
 | --- | --- |
 | Backend | Source registration/download/removal with constrained paths and atomic storage |
 | Verification | Commit, working tree, index flags, Git object checks; stale success cleared |
 | Protection | Catalog migration; terminal-only force for managed-source removal |
-| CLI / web | Arabic/English interfaces, separate source/install state, detection and launch |
+| CLI / web | Arabic/English interfaces, separate source/install state, detection, launch, background web jobs |
 | Installation | Native package-manager commands for the supported combinations above |
 | Error handling | Structured HTTP errors, CLI exit codes, recoverable registry errors |
 | Logging | Persistent rotating logs per process |

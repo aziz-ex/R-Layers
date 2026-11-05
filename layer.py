@@ -2,11 +2,14 @@
 import functools
 import logging
 import os
+import queue
 import re
+import signal
 import shutil
 import subprocess
 import tempfile
 import threading
+import time
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -29,6 +32,10 @@ APPS = [
     ("Blender", "https://github.com/blender/blender", "GPL-2.0", "Blender Foundation", "removable"),
 ]
 RETIRED = ["World Clock"]
+
+
+class OperationCancelled(subprocess.SubprocessError):
+    """Raised when a user cancels a cancellable source operation."""
 
 
 def now():
@@ -66,6 +73,7 @@ class PackageAbstractionLayer:
         self.cache_file = self.store.path
         self.apps_dir = self.cache_dir / "apps"
         self._operation_lock = threading.RLock()
+        self._thread_state = threading.local()
         self.last_error = ""
         self.logger = logging.getLogger(f"rlayers.{self.cache_dir}")
         self.logger.setLevel(logging.INFO)
@@ -130,6 +138,14 @@ class PackageAbstractionLayer:
             handler.close()
             self.logger.removeHandler(handler)
 
+    @property
+    def last_error(self):
+        return getattr(self._thread_state, "last_error", "")
+
+    @last_error.setter
+    def last_error(self, value):
+        self._thread_state.last_error = value
+
     def _app_path(self, name):
         self._validate_name(name)
         if self.apps_dir.resolve() != self.cache_dir / "apps":
@@ -163,22 +179,173 @@ class PackageAbstractionLayer:
         return subprocess.run(["git", "-C", str(path), *args], check=True, capture_output=True,
                               text=True, encoding="utf-8", errors="replace", timeout=120).stdout.strip()
 
-    def _inspect_source(self, name, info):
+    @staticmethod
+    def _report_progress(callback, percent, message):
+        if callback is None:
+            return
+        try:
+            callback(percent, message)
+        except Exception:
+            # Progress reporting must never strand a Git process or a staging directory.
+            pass
+
+    def _inspect_source(self, name, info, progress_callback=None, cancel_event=None):
+        def checkpoint(percent, message):
+            if cancel_event is not None and cancel_event.is_set():
+                raise OperationCancelled("Operation cancelled by user.")
+            self._report_progress(progress_callback, percent, message)
+
+        checkpoint(5, "Checking the managed repository")
         path = self._recorded_path(name, info)
         if not path.is_dir() or not (path / ".git").is_dir() or (path / ".git").resolve() != path / ".git":
             raise ValueError(f"No managed Git source found for '{name}'")
         if Path(self._git(path, "rev-parse", "--show-toplevel")).resolve() != path:
             raise ValueError("Git repository root does not match the app directory")
+        checkpoint(30, "Checking the recorded commit")
         commit = self._git(path, "rev-parse", "HEAD")
         if not info.get("commit") or commit != info["commit"]:
             raise ValueError(f"'{name}' commit does not match the recorded download")
+        checkpoint(50, "Checking tracked files and index flags")
         flags = self._git(path, "ls-files", "-v").splitlines()
         if any(line and (line[0].islower() or line[0] == "S") for line in flags):
             raise ValueError("Cannot verify files hidden by assume-unchanged or skip-worktree index flags")
         if self._git(path, "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none"):
             raise ValueError(f"'{name}' contains modified, deleted, staged or untracked files")
+        checkpoint(75, "Checking Git object integrity")
         self._git(path, "fsck", "--no-dangling")
+        checkpoint(100, "Source verification complete")
         return commit
+
+    @staticmethod
+    def _kill_process_tree(process):
+        if os.name == "nt":
+            try:
+                subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], check=False,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5,
+                               creationflags=subprocess.CREATE_NO_WINDOW)
+            except (OSError, subprocess.SubprocessError):
+                pass
+            if process.poll() is None:
+                process.kill()
+            return
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    @staticmethod
+    def _stop_process(process):
+        if process.poll() is not None:
+            return
+        if os.name == "nt":
+            try:
+                process.send_signal(signal.CTRL_BREAK_EVENT)
+            except (AttributeError, OSError, ValueError):
+                PackageAbstractionLayer._kill_process_tree(process)
+        else:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                return
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            PackageAbstractionLayer._kill_process_tree(process)
+            process.wait()
+
+    def _clone_source(self, url, destination, timeout, progress_callback, cancel_event):
+        if cancel_event is not None and cancel_event.is_set():
+            raise OperationCancelled("Operation cancelled by user.")
+        command = ["git", "-c", "core.longpaths=true", "clone", "--progress", "--depth", "1", "--",
+                   url, str(destination)]
+        process_options = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}
+        process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                   bufsize=0, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"}, **process_options)
+        chunks = queue.Queue()
+
+        def read_stderr():
+            try:
+                while True:
+                    data = os.read(process.stderr.fileno(), 4096)
+                    if not data:
+                        break
+                    chunks.put(data)
+            except OSError:
+                pass
+            finally:
+                chunks.put(None)
+
+        reader = threading.Thread(target=read_stderr, name="rlayers-git-output", daemon=True)
+        reader.start()
+        started = time.monotonic()
+        buffer = bytearray()
+        error_output = []
+        reader_done = False
+        last_percent = 0
+
+        def consume(data):
+            nonlocal last_percent
+            if data:
+                buffer.extend(data)
+            while True:
+                indexes = [index for index in (buffer.find(b"\r"), buffer.find(b"\n")) if index >= 0]
+                if not indexes:
+                    break
+                index = min(indexes)
+                line = bytes(buffer[:index]).decode("utf-8", errors="replace").strip()
+                del buffer[:index + 1]
+                while buffer[:1] in (b"\r", b"\n"):
+                    del buffer[:1]
+                if not line:
+                    continue
+                error_output.append(line)
+                error_output[:] = error_output[-40:]
+                match = re.search(r"(Enumerating|Counting|Compressing|Receiving|Resolving) objects:\s*(\d{1,3})%", line, re.I)
+                if match:
+                    stage, raw_percent = match.groups()
+                    part = int(raw_percent)
+                    stage_start, stage_span = {
+                        "enumerating": (2, 10), "counting": (12, 8), "compressing": (20, 20),
+                        "receiving": (40, 55), "resolving": (95, 4),
+                    }.get(stage.lower(), (5, 90))
+                    last_percent = max(last_percent, min(99, stage_start + part * stage_span // 100))
+                    self._report_progress(progress_callback, last_percent, f"Git {stage.lower()} objects: {part}%")
+                elif "remote:" in line.lower():
+                    self._report_progress(progress_callback, last_percent or 2, "Receiving repository data from GitHub")
+
+        try:
+            self._report_progress(progress_callback, 1, "Connecting to GitHub")
+            while process.poll() is None or not reader_done:
+                if cancel_event is not None and cancel_event.is_set():
+                    self._stop_process(process)
+                    raise OperationCancelled("Operation cancelled by user.")
+                if time.monotonic() - started > timeout:
+                    self._stop_process(process)
+                    detail = "\n".join(error_output[-10:])
+                    raise subprocess.TimeoutExpired(command, timeout, stderr=detail)
+                try:
+                    chunk = chunks.get(timeout=0.1)
+                    if chunk is None:
+                        reader_done = True
+                    else:
+                        consume(chunk)
+                except queue.Empty:
+                    pass
+            if buffer:
+                tail = bytes(buffer).decode("utf-8", errors="replace").strip()
+                if tail:
+                    error_output.append(tail)
+            return_code = process.wait()
+            if return_code:
+                detail = "\n".join(error_output[-10:])
+                raise subprocess.CalledProcessError(return_code, command, stderr=detail)
+        except BaseException:
+            if process.poll() is None:
+                self._stop_process(process)
+            raise
+        finally:
+            process.stderr.close()
+            reader.join(timeout=2)
 
     @operation
     def add_package(self, name, version, dependencies=None):
@@ -224,7 +391,7 @@ class PackageAbstractionLayer:
                 print(f"    Source: {info.get('source_url', '')}")
 
     @operation
-    def download_app(self, name, apps_dir=None, timeout=1800):
+    def download_app(self, name, apps_dir=None, timeout=1800, progress_callback=None, cancel_event=None):
         info = self._app(name)
         self._validate_url(info.get("source_url", ""))
         if apps_dir is not None and Path(apps_dir).resolve() != self.apps_dir:
@@ -235,16 +402,16 @@ class PackageAbstractionLayer:
                 raise ValueError(f"Unregistered files exist at {dest}; move them aside before downloading.")
             info["verified"] = False
             self._save_cache()
-            commit = self._inspect_source(name, info)
+            commit = self._inspect_source(name, info, progress_callback, cancel_event)
         else:
             self.apps_dir.mkdir(parents=True, exist_ok=True)
             staging = Path(tempfile.mkdtemp(prefix=f".download-{name}-", dir=self.apps_dir))
-            print(f"Downloading source for '{name}'...", flush=True)
+            self._report_progress(progress_callback, 0, f"Preparing download for {name}")
             try:
-                subprocess.run(["git", "-c", "core.longpaths=true", "clone", "--depth", "1", "--",
-                                info["source_url"], str(staging)], check=True, capture_output=True,
-                               text=True, encoding="utf-8", errors="replace", timeout=timeout,
-                               env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+                self._clone_source(info["source_url"], staging, timeout, progress_callback, cancel_event)
+                self._report_progress(progress_callback, 98, "Recording the downloaded commit")
+                if cancel_event is not None and cancel_event.is_set():
+                    raise OperationCancelled("Operation cancelled by user.")
                 commit = self._git(staging, "rev-parse", "HEAD")
                 staging.rename(dest)
             finally:
@@ -252,6 +419,7 @@ class PackageAbstractionLayer:
                     self._rmtree(staging)
         info.update(local_path=str(dest), commit=commit, source_downloaded=True, verified=False)
         self._save_cache()
+        self._report_progress(progress_callback, 100, "Download complete")
         print(f"Source downloaded: {dest} ({commit[:7]}). Use install or link to run the app.")
         return True
 
@@ -275,11 +443,11 @@ class PackageAbstractionLayer:
         return True
 
     @operation
-    def verify_app(self, name):
+    def verify_app(self, name, progress_callback=None, cancel_event=None):
         info = self._app(name)
         info["verified"] = False
         self._save_cache()
-        commit = self._inspect_source(name, info)
+        commit = self._inspect_source(name, info, progress_callback, cancel_event)
         info.update(verified=True, verified_at=now())
         self._save_cache()
         print(f"'{name}' source verified ({commit[:7]}): clean working tree and valid Git objects.")

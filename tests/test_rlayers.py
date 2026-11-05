@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from http.server import ThreadingHTTPServer
@@ -16,6 +17,7 @@ from unittest.mock import patch
 import app_runtime
 import rlayers
 import rlayers_web as web
+from background_jobs import BackgroundJobs
 from layer import APPS, PROJECT_DIR, PackageAbstractionLayer
 from storage import RegistryError, RegistryStore
 
@@ -230,22 +232,46 @@ class SourceTests(IsolatedCase):
 
     def test_failed_clone_cleans_only_owned_staging_directory(self):
         manager = self.manager()
-        with patch("layer.subprocess.run", side_effect=subprocess.TimeoutExpired("git", 1)):
+        with patch("layer.subprocess.Popen", side_effect=subprocess.CalledProcessError(1, "git clone", stderr="clone failed")):
             self.assertFalse(manager.download_app("Firefox", timeout=1))
         self.assertEqual(list(manager.apps_dir.iterdir()), [])
+
+    def test_cancelled_clone_cleans_its_staging_directory(self):
+        manager = self.manager()
+        cancel = threading.Event()
+        processes = []
+        real_popen = subprocess.Popen
+
+        def long_lived_git(command, **kwargs):
+            process = real_popen([sys.executable, "-c", "import time; time.sleep(30)"], **kwargs)
+            processes.append(process)
+            return process
+
+        def cancel_on_start(percent, message):
+            if message == "Connecting to GitHub":
+                cancel.set()
+
+        with patch("layer.subprocess.Popen", side_effect=long_lived_git):
+            self.assertFalse(manager.download_app("Firefox", progress_callback=cancel_on_start, cancel_event=cancel))
+        self.assertEqual(list(manager.apps_dir.iterdir()), [])
+        self.assertIn("cancelled", manager.last_error.lower())
+        self.assertTrue(processes)
+        self.assertIsNotNone(processes[0].poll())
 
     def test_download_and_reuse_real_local_git_repository(self):
         manager = self.manager()
         seed_manager = self.manager(self.root / "seed")
         seed = self.source(seed_manager)
-        real_run = subprocess.run
+        real_popen = subprocess.Popen
         def local_clone(command, **kwargs):
             if "clone" in command:
                 command = [*command[:-2], str(seed), command[-1]]
-            return real_run(command, **kwargs)
-        with patch("layer.subprocess.run", side_effect=local_clone):
-            self.assertTrue(manager.download_app("Firefox"))
+            return real_popen(command, **kwargs)
+        progress = []
+        with patch("layer.subprocess.Popen", side_effect=local_clone):
+            self.assertTrue(manager.download_app("Firefox", progress_callback=lambda percent, message: progress.append((percent, message))))
         self.assertTrue(manager.get_package("Firefox")["source_downloaded"])
+        self.assertEqual(progress[-1][0], 100)
         self.assertFalse(manager.get_package("Firefox").get("installed", False))
         self.assertTrue(manager.verify_app("Firefox"))
         self.assertTrue(manager.download_app("Firefox"))
@@ -337,9 +363,81 @@ class RuntimeTests(IsolatedCase):
         self.assertFalse(manager.get_package("VLC")["installed"])
 
 
+class BackgroundJobTests(IsolatedCase):
+    def wait_for_status(self, jobs, job_id, status, timeout=5):
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            current = next(job for job in jobs.snapshot() if job["id"] == job_id)
+            if current["status"] == status:
+                return current
+            time.sleep(0.02)
+        self.fail(f"job did not reach {status}: {jobs.snapshot()}")
+
+    def test_download_job_reports_progress_and_can_be_cancelled(self):
+        manager = self.manager()
+        jobs = BackgroundJobs(manager)
+        started = threading.Event()
+
+        def slow_download(name, progress_callback, cancel_event):
+            started.set()
+            progress_callback(35, "Receiving repository data")
+            cancel_event.wait(5)
+            manager.last_error = "Operation cancelled by user."
+            return False
+
+        try:
+            with patch.object(manager, "download_app", side_effect=slow_download):
+                job = jobs.submit("download", "firefox")
+                self.assertTrue(started.wait(2))
+                jobs.cancel(job["id"])
+                result = self.wait_for_status(jobs, job["id"], "cancelled")
+            self.assertEqual(result["name"], "Firefox")
+            self.assertEqual(result["progress"], 35)
+            self.assertFalse(jobs.has_active())
+        finally:
+            jobs.close(wait=True)
+
+    def test_job_history_survives_service_recreation_and_marks_active_as_interrupted(self):
+        manager = self.manager()
+        jobs = BackgroundJobs(manager)
+        try:
+            with patch.object(manager, "verify_app", return_value=True):
+                job = jobs.submit("verify", "Firefox")
+                result = self.wait_for_status(jobs, job["id"], "succeeded")
+            self.assertEqual(result["progress"], 100)
+        finally:
+            jobs.close(wait=True)
+        reopened = BackgroundJobs(manager)
+        try:
+            self.assertEqual(reopened.snapshot()[0]["status"], "succeeded")
+        finally:
+            reopened.close(wait=True)
+
+        payload = [{"id": "a" * 32, "action": "download", "name": "VLC", "status": "running",
+                    "progress": 10, "message": "Downloading", "created_at": "now", "updated_at": "now", "error": ""}]
+        jobs.path.write_text(json.dumps(payload), encoding="utf-8")
+        recovered = BackgroundJobs(manager)
+        try:
+            self.assertEqual(recovered.snapshot()[0]["status"], "interrupted")
+        finally:
+            recovered.close(wait=True)
+
+        history_path = manager.cache_dir / "web-jobs.json"
+        history_path.write_text("damaged history", encoding="utf-8")
+        unreadable = BackgroundJobs(manager)
+        try:
+            with patch.object(manager, "verify_app", return_value=True):
+                with self.assertRaises(OSError):
+                    unreadable.submit("verify", "Firefox")
+            self.assertEqual(history_path.read_text(encoding="utf-8"), "damaged history")
+        finally:
+            unreadable.close(wait=True)
+
+
 class WebTests(IsolatedCase):
     def setUp(self):
         super().setUp()
+        web.shutdown_jobs()
         self.manager_instance = self.manager()
         self.layer_patch = patch.object(web, "layer", self.manager_instance)
         self.layer_patch.start()
@@ -351,6 +449,7 @@ class WebTests(IsolatedCase):
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=5)
+        web.shutdown_jobs()
         self.layer_patch.stop()
         super().tearDown()
 
@@ -377,6 +476,56 @@ class WebTests(IsolatedCase):
         self.assertTrue(json.loads(data)["ok"])
         self.assertTrue(self.manager_instance.get_package("Firefox")["installed"])
         launch.assert_not_called()
+
+    def test_browser_starts_a_background_verification_and_persists_its_result(self):
+        body = json.dumps({"action": "verify", "name": "Firefox"})
+        with patch.object(self.manager_instance, "verify_app", return_value=True):
+            status, data = self.request("POST", "/api/jobs", body, {"X-Token": web.TOKEN})
+            self.assertEqual(status, 202)
+            job_id = json.loads(data)["job"]["id"]
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                state = json.loads(self.request("GET", "/api/state")[1])
+                job = next(item for item in state["jobs"] if item["id"] == job_id)
+                if job["status"] == "succeeded":
+                    break
+                time.sleep(0.02)
+            self.assertEqual(job["status"], "succeeded")
+            self.assertEqual(state["jobs"][0]["id"], job_id)
+
+    def test_browser_can_cancel_a_background_download(self):
+        started = threading.Event()
+
+        def wait_for_cancel(name, progress_callback, cancel_event):
+            started.set()
+            progress_callback(22, "Receiving repository data from GitHub")
+            cancel_event.wait(5)
+            self.manager_instance.last_error = "Operation cancelled by user."
+            return False
+
+        with patch.object(self.manager_instance, "download_app", side_effect=wait_for_cancel):
+            body = json.dumps({"action": "download", "name": "Firefox"})
+            status, data = self.request("POST", "/api/jobs", body, {"X-Token": web.TOKEN})
+            self.assertEqual(status, 202)
+            job_id = json.loads(data)["job"]["id"]
+            self.assertTrue(started.wait(2))
+            status, data = self.request("POST", f"/api/jobs/{job_id}/cancel", headers={"X-Token": web.TOKEN})
+            self.assertEqual(status, 200)
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                state = json.loads(self.request("GET", "/api/state")[1])
+                job = next(item for item in state["jobs"] if item["id"] == job_id)
+                if job["status"] == "cancelled":
+                    break
+                time.sleep(0.02)
+            self.assertEqual(job["status"], "cancelled")
+            self.assertEqual(job["progress"], 22)
+
+    def test_long_actions_cannot_bypass_background_job_api(self):
+        body = json.dumps({"action": "download", "name": "Firefox"})
+        status, data = self.request("POST", "/api/action", body, {"X-Token": web.TOKEN})
+        self.assertEqual(status, 400)
+        self.assertIn("/api/jobs", json.loads(data)["error"])
 
     def test_mutation_requires_token_and_valid_host(self):
         body = json.dumps({"action": "remove", "name": "Firefox"})

@@ -23,6 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from background_jobs import BackgroundJobs
 from layer import PackageAbstractionLayer
 from storage import RegistryError
 import app_runtime
@@ -34,6 +35,8 @@ LOCK = threading.Lock()
 RTL = {"ar", "he", "fa", "ur"}
 layer = None
 INIT_LOCK = threading.Lock()
+jobs = None
+JOBS_INIT_LOCK = threading.Lock()
 
 
 def get_layer():
@@ -42,6 +45,23 @@ def get_layer():
         if layer is None:
             layer = PackageAbstractionLayer()
     return layer
+
+
+def get_jobs():
+    global jobs
+    with JOBS_INIT_LOCK:
+        manager = get_layer()
+        if jobs is None or jobs.manager is not manager:
+            jobs = BackgroundJobs(manager)
+    return jobs
+
+
+def shutdown_jobs():
+    global jobs
+    with JOBS_INIT_LOCK:
+        current, jobs = jobs, None
+    if current is not None:
+        current.close(wait=True)
 
 STRINGS = {
     "en": {
@@ -66,6 +86,10 @@ STRINGS = {
         "system_p": "Protected", "removable_p": "Removable",
         "locked_hint": "Protected source. Remove from a terminal with --force.",
         "confirm_remove": "Remove the managed source files for {n}?", "working": "Working:", "log_title": "Last result",
+        "jobs_title": "Background source jobs", "job_queued": "Queued", "job_running": "Running",
+        "job_succeeded": "Complete", "job_failed": "Failed", "job_cancelled": "Cancelled",
+        "job_interrupted": "Interrupted", "cancel": "Cancel download", "cancel_requested": "Cancelling…",
+        "job_error": "Details:",
     },
     "ar": {
         "title": "R-Layers", "subtitle": "مدير الحزم والتطبيقات",
@@ -87,6 +111,10 @@ STRINGS = {
         "system_p": "محمي", "removable_p": "قابل للحذف",
         "locked_hint": "المصدر محمي. حذفه من الطرفية يتطلب --force.",
         "confirm_remove": "حذف ملفات المصدر المُدارة لتطبيق {n}؟", "working": "جارٍ التنفيذ:", "log_title": "آخر نتيجة",
+        "jobs_title": "مهام تنزيل وفحص المصادر", "job_queued": "في قائمة الانتظار", "job_running": "قيد التنفيذ",
+        "job_succeeded": "اكتملت", "job_failed": "فشلت", "job_cancelled": "أُلغيت",
+        "job_interrupted": "توقفت عند إغلاق الخادم", "cancel": "إلغاء التنزيل", "cancel_requested": "جارٍ الإلغاء…",
+        "job_error": "التفاصيل:",
     },
 }
 
@@ -144,7 +172,7 @@ def state(lang=""):
              "commit": (i.get("commit") or "")[:7]}
             for n, i in packages.items() if i.get("type") == "bundled_app"]
     return {"version": __version__, "system": system, "lang": code, "mode": mode, "rtl": code in RTL,
-            "t": strings, "apps": apps}
+            "t": strings, "apps": apps, "jobs": get_jobs().snapshot()}
 
 
 PAGE = r"""<!doctype html>
@@ -178,6 +206,7 @@ button:disabled{opacity:.5;cursor:wait}
 button:focus-visible,select:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
 .lock{color:var(--mute);font-size:13px;max-width:230px}
 pre{direction:ltr;text-align:left;white-space:pre-wrap;background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:12px 14px;min-height:64px;margin:0}
+.job{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:10px 12px;margin:0 0 8px}.job-top{display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap}.job progress{width:min(100%,360px);height:12px;accent-color:var(--acc)}.job-error{color:var(--bad);white-space:pre-wrap;overflow-wrap:anywhere}
 .guide{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:14px;margin-top:16px}
 .guide h2{margin:0 0 6px}.guide p{margin:0 0 10px}#summary{margin:10px 0;color:var(--mute)}
 @media (max-width:700px){.app{grid-template-columns:1fr}}
@@ -190,6 +219,7 @@ pre{direction:ltr;text-align:left;white-space:pre-wrap;background:var(--panel);b
 <div class="sys" id="sys"></div>
 <section class="guide"><h2 id="guide-title"></h2><p id="guide-text"></p><button id="scan" class="primary"></button></section>
 <h2 id="apps-title"></h2><p id="summary" aria-live="polite"></p><div id="list"></div>
+<h2 id="jobs-title"></h2><div id="jobs" aria-live="polite"></div>
 <h2 id="log-title"></h2><pre id="log"></pre>
 </main>
 <script>
@@ -221,9 +251,11 @@ function render(){
   $("guide-title").textContent=t.getting_started;$("guide-text").textContent=t.getting_started_text;
   $("summary").textContent=t.summary.replace("{installed}",S.apps.filter(a=>a.installed).length).replace("{sources}",S.apps.filter(a=>a.source_downloaded).length);
   $("apps-title").textContent=t.apps;
+  $("jobs-title").textContent=t.jobs_title;
   $("log-title").textContent=t.log_title;
-  $("scan").textContent=t.scan;$("scan").disabled=busy;
+  $("scan").textContent=t.scan;
   $("list").replaceChildren(...(S.apps.length?S.apps.map(row):[el("p",{className:"sub",textContent:t.no_apps})]));
+  renderJobs();
 }
 function row(a){
   const t=S.t, locked=a.protection==="system";
@@ -247,8 +279,52 @@ function row(a){
   return el("div",{className:"app "+(locked?"system":"removable")},
     el("div",{},el("div",{className:"name",textContent:a.name}),el("div",{className:"meta",textContent:a.credit}),el("div",{className:"row"},...tags)),acts);
 }
+function renderJobs(){
+  const t=S.t, active=S.jobs.some(j=>j.status==="queued"||j.status==="running");
+  $("scan").disabled=busy||active;
+  document.querySelectorAll("#list button").forEach(b=>b.disabled=busy||active);
+  const cards=S.jobs.map(j=>{
+    const title=el("div",{className:"job-top"},
+      el("b",{textContent:j.name+" · "+(j.action==="download"?t.download:t.verify)}),
+      el("span",{className:"tag",textContent:t["job_"+j.status]||j.status}));
+    const card=el("div",{className:"job"},title,el("div",{className:"meta",textContent:jobMessage(j)}),
+      el("progress",{max:100,value:j.progress==null?0:j.progress}));
+    if(j.error)card.append(el("div",{className:"job-error",textContent:t.job_error+" "+j.error}));
+    if((j.status==="running"||j.status==="queued")&&j.action==="download"){
+      const cancel=btn(j.cancel_requested?t.cancel_requested:t.cancel,()=>cancelJob(j.id),"danger");
+      cancel.disabled=Boolean(j.cancel_requested);card.append(cancel);
+    }
+    return card;
+  });
+  $("jobs").replaceChildren(...cards);
+}
+function jobMessage(job){
+  const raw=job.message||"";
+  if(S.lang!=="ar")return raw;
+  const fixed={
+    "Waiting for the current job to finish.":"بانتظار انتهاء المهمة الحالية.","Starting.":"جارٍ بدء المهمة.",
+    "Connecting to GitHub":"جارٍ الاتصال بـ GitHub","Receiving repository data from GitHub":"جارٍ استلام بيانات المستودع من GitHub",
+    "Recording the downloaded commit":"جارٍ تسجيل نسخة التنزيل","Download complete.":"اكتمل تنزيل المصدر.",
+    "Verify complete.":"اكتمل فحص المصدر.","Download failed.":"فشل تنزيل المصدر.","Verify failed.":"فشل فحص المصدر.",
+    "Checking the managed repository":"جارٍ التحقق من مستودع المصدر","Checking the recorded commit":"جارٍ فحص النسخة المسجلة",
+    "Checking tracked files and index flags":"جارٍ فحص الملفات وإعدادات Git","Checking Git object integrity":"جارٍ فحص سلامة بيانات Git",
+    "Source verification complete":"اكتمل فحص المصدر","Cancelled before starting.":"أُلغيت قبل البدء.",
+    "Cancelled. Temporary download files were cleaned up.":"أُلغيت المهمة وحُذف المجلد المؤقت.",
+    "The web server stopped before this job finished.":"توقف الخادم قبل اكتمال المهمة.",
+    "Cancelling download…":"جارٍ إلغاء التنزيل…"
+  };
+  if(fixed[raw])return fixed[raw];
+  if(raw.startsWith("Preparing download for "))return "جارٍ تجهيز تنزيل "+raw.slice("Preparing download for ".length);
+  const match=raw.match(/^Git (enumerating|counting|compressing|receiving|resolving) objects: (\d+)%$/i);
+  if(match){
+    const stage={enumerating:"حصر",counting:"عدّ",compressing:"ضغط",receiving:"استلام",resolving:"معالجة"}[match[1].toLowerCase()];
+    return "Git — "+stage+" العناصر: "+match[2]+"٪";
+  }
+  return raw;
+}
 async function act(action,name,executable=""){
   if(busy||!S)return;
+  if(action==="download"||action==="verify")return startJob(action,name);
   if(action==="remove"&&!confirm(S.t.confirm_remove.replace("{n}",name)))return;
   busy=true;document.querySelectorAll("button").forEach(b=>b.disabled=true);
   $("log").textContent=S.t.working+" "+action+" "+name;
@@ -257,11 +333,27 @@ async function act(action,name,executable=""){
       body:JSON.stringify({action,name,executable})});
     const d=await r.json();$("log").textContent=d.log||d.error||"";
   }catch(e){$("log").textContent=String(e)}
-  busy=false;await load();document.querySelectorAll("button").forEach(b=>b.disabled=false);
+  busy=false;await load();
+}
+async function startJob(action,name){
+  if(busy||!S)return;
+  try{
+    const r=await fetch("/api/jobs",{method:"POST",headers:{"Content-Type":"application/json","X-Token":TOKEN},
+      body:JSON.stringify({action,name})});
+    const d=await r.json();if(!r.ok)throw new Error(d.error||"Request failed");
+    $("log").textContent=d.job.message||"";await load();
+  }catch(e){$("log").textContent=String(e)}
+}
+async function cancelJob(id){
+  try{
+    const r=await fetch("/api/jobs/"+encodeURIComponent(id)+"/cancel",{method:"POST",headers:{"X-Token":TOKEN}});
+    const d=await r.json();if(!r.ok)throw new Error(d.error||"Request failed");await load();
+  }catch(e){$("log").textContent=String(e)}
 }
 $("lang").onchange=e=>{forced=e.target.value;load()};
 $("scan").onclick=()=>act("scan","");
 load();
+setInterval(()=>{if(!busy)load()},1000);
 </script></body></html>"""
 
 
@@ -306,8 +398,23 @@ class Handler(BaseHTTPRequestHandler):
         origin = self.headers.get("Origin")
         if origin and origin not in (f"http://127.0.0.1:{self.server.server_port}", f"http://localhost:{self.server.server_port}"):
             return self._send(403, json.dumps({"error": "forbidden origin"}))
-        if self.path != "/api/action":
+        path = urlparse(self.path).path
+        cancel_match = re.fullmatch(r"/api/jobs/([0-9a-f]{32})/cancel", path)
+        if path not in ("/api/action", "/api/jobs") and not cancel_match:
             return self._send(404, json.dumps({"error": "not found"}))
+        if cancel_match:
+            if not LOCK.acquire(blocking=False):
+                return self._send(409, json.dumps({"error": "another browser action is busy"}))
+            try:
+                try:
+                    job = get_jobs().cancel(cancel_match.group(1))
+                    return self._send(200, json.dumps({"ok": True, "job": job}, ensure_ascii=False))
+                except KeyError as exc:
+                    return self._send(404, json.dumps({"error": str(exc)}))
+                except ValueError as exc:
+                    return self._send(400, json.dumps({"error": str(exc)}, ensure_ascii=False))
+            finally:
+                LOCK.release()
         try:
             size = int(self.headers.get("Content-Length", 0))
             if not 0 < size <= 4096:
@@ -325,15 +432,28 @@ class Handler(BaseHTTPRequestHandler):
             manager = get_layer()
         except (RegistryError, OSError, ValueError) as exc:
             return self._send(503, json.dumps({"error": str(exc)}))
-        funcs = {"download": manager.download_app, "verify": manager.verify_app,
-                 "remove": manager.remove_app, "launch": manager.launch_app,
+        if path == "/api/jobs":
+            if not LOCK.acquire(blocking=False):
+                return self._send(409, json.dumps({"error": "another browser action is busy"}))
+            try:
+                try:
+                    job = get_jobs().submit(action, name)
+                    return self._send(202, json.dumps({"ok": True, "job": job}, ensure_ascii=False))
+                except (ValueError, OSError) as exc:
+                    return self._send(400, json.dumps({"error": str(exc)}, ensure_ascii=False))
+            finally:
+                LOCK.release()
+        funcs = {"remove": manager.remove_app, "launch": manager.launch_app,
                  "scan": manager.scan_apps, "link": manager.link_app}
         buf = io.StringIO()
         if action not in funcs:
-            return self._send(400, json.dumps({"error": "unknown action"}))
+            reason = "Use /api/jobs for source downloads and checks." if action in ("download", "verify") else "unknown action"
+            return self._send(400, json.dumps({"error": reason}))
         if not LOCK.acquire(blocking=False):
             return self._send(409, json.dumps({"error": "another browser action is busy"}))
         try:
+            if get_jobs().has_active():
+                return self._send(409, json.dumps({"error": "a background source job is active"}))
             with contextlib.redirect_stdout(buf):
                 try:
                     if action == "scan":
@@ -365,4 +485,6 @@ if __name__ == "__main__":
     except (OSError, RegistryError, ValueError) as exc:
         print(f"Error: {exc}")
         raise SystemExit(1)
+    finally:
+        shutdown_jobs()
 

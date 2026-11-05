@@ -10,7 +10,7 @@ sys.path.insert(0, str(ROOT))
 from version import __version__  # noqa: E402
 
 RELEASE_FILES = (
-    "layer.py", "storage.py", "app_runtime.py", "diagnostics.py", "rlayers.py",
+    "layer.py", "storage.py", "app_runtime.py", "diagnostics.py", "background_jobs.py", "rlayers.py",
     "rlayers_web.py", "version.py", "README.md", "QUICKSTART.ar.md", "CHANGELOG.md",
     "ROADMAP.md", "LICENSE", "scripts/build_release.py", "tests/test_rlayers.py",
     "tests/test_release.py", ".github/workflows/tests.yml", ".gitignore",
@@ -30,7 +30,7 @@ def build_release(destination, root=ROOT):
     # Fixed order, permissions and timestamps make identical sources reproducible.
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as output:
         for filename, path in zip(RELEASE_FILES, files):
-            item = zipfile.ZipInfo(f"{name}/{filename}", date_time=(2026, 10, 30, 0, 0, 0))
+            item = zipfile.ZipInfo(f"{name}/{filename}", date_time=(2026, 11, 5, 0, 0, 0))
             item.external_attr = 0o100644 << 16
             item.compress_type = zipfile.ZIP_DEFLATED
             output.writestr(item, path.read_bytes())
